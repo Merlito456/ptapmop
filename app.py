@@ -1,24 +1,31 @@
 import os
 import re
 import io
-import time
 import base64
 import streamlit as st
-from PIL import Image
+
 from docx import Document
 from docx.shared import Inches
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
 
+from streamlit_js_eval import streamlit_js_eval
+
+
 TEMPLATE_FILE = "Template.docx"
 
 
 # -----------------------------
-# DOCX helpers (same logic)
+# DOCX helpers
 # -----------------------------
 def normalize_spaces(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
+
+
+def safe_filename(s: str) -> str:
+    s = re.sub(r'[\\/*?:"<>|]+', "_", s)
+    return s.strip().replace(" ", "_")
 
 
 def iter_all_paragraphs(container):
@@ -106,10 +113,6 @@ def insert_paragraph_after(paragraph, text="", style=None):
 
 
 def insert_image_after(paragraph, image_bytes, width=Inches(4.5), caption=None):
-    """
-    Insert image from bytes after paragraph.
-    python-docx add_picture accepts a file-like object.
-    """
     p_img = insert_paragraph_after(paragraph)
     run = p_img.add_run()
     run.add_picture(io.BytesIO(image_bytes), width=width)
@@ -145,7 +148,6 @@ def add_hyperlink(paragraph, text, url, color="0000FF", underline=True):
         rPr.append(u)
 
     new_run.append(rPr)
-
     text_elem = OxmlElement("w:t")
     text_elem.text = text
     new_run.append(text_elem)
@@ -155,6 +157,9 @@ def add_hyperlink(paragraph, text, url, color="0000FF", underline=True):
     return hyperlink
 
 
+# -----------------------------
+# Business logic
+# -----------------------------
 def build_olt_label(equipment: str, custom_olt_label: str) -> str:
     eq = normalize_spaces(equipment).lower()
     if eq == "nokia lightspan mf-2":
@@ -178,9 +183,7 @@ def insert_power_section_content(doc, data, rs1_img_bytes, rs2_img_bytes):
         raise ValueError("Could not find FUSE anchor text in template.")
 
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
-    new_fuse = build_fuse_line(olt_label, data["equipment"])
-
-    set_paragraph_text(anchor, new_fuse)
+    set_paragraph_text(anchor, build_fuse_line(olt_label, data["equipment"]))
 
     rs1_line = f"RS1 + {data['rs1_rectifier_name']} + {data['rs1_load_assignment']}"
     rs2_line = f"RS2 + {data['rs2_rectifier_name']} + {data['rs2_load_assignment']}"
@@ -196,17 +199,14 @@ def insert_power_section_content(doc, data, rs1_img_bytes, rs2_img_bytes):
         insert_image_after(p2, rs2_img_bytes, width=Inches(4.5), caption="RS2")
 
 
-def insert_supporting_documents(doc, pdf_filename):
-    if not pdf_filename:
+def insert_supporting_documents(doc, tssr_pdf_name: str):
+    if not tssr_pdf_name:
         return
     anchor, _ = find_any_anchor(doc, ["Supporting Documents"])
     if not anchor:
         raise ValueError("Could not find 'Supporting Documents' section.")
-    p = insert_paragraph_after(anchor)
-    p.add_run("TSSR: ")
-    # In Streamlit Cloud we can't reliably link to local filesystem for the downloader.
-    # So we just put the filename.
-    p.add_run(pdf_filename)
+    p = insert_paragraph_after(anchor, f"TSSR: {tssr_pdf_name}")
+    # If you have a URL, we can hyperlink it instead.
 
 
 def insert_existing_rectifier_image(doc, rectifier_img_bytes):
@@ -246,95 +246,80 @@ def generate_docx_bytes(data, rs1_img_bytes, rs2_img_bytes, rectifier_img_bytes,
 
 
 # -----------------------------
-# Streamlit "paste image" via JS
+# Clipboard via streamlit-js-eval
 # -----------------------------
-def paste_image_widget(key: str, label: str):
+def clipboard_image_to_bytes(button_key: str):
     """
-    Creates a paste button. When user pastes, it stores base64 PNG in st.session_state[key].
-    Requires user interaction and browser permissions.
+    Returns bytes if clipboard has an image, else None.
+    Requires user click.
     """
-    import streamlit.components.v1 as components
-
-    html = f"""
-    <div style="display:flex; gap:10px; align-items:center;">
-      <button id="btn_{key}" type="button">{label}</button>
-      <span id="status_{key}" style="font-family:Arial; font-size:12px; color:#444;"></span>
-    </div>
-    <script>
-      const btn = document.getElementById("btn_{key}");
-      const status = document.getElementById("status_{key}");
-
-      async function readClipboardImage() {{
-        try {{
-          const items = await navigator.clipboard.read();
-          for (const item of items) {{
-            for (const type of item.types) {{
-              if (type.startsWith("image/")) {{
-                const blob = await item.getType(type);
+    js = """
+    async () => {
+      try {
+        const items = await navigator.clipboard.read();
+        for (const item of items) {
+          for (const type of item.types) {
+            if (type.startsWith('image/')) {
+              const blob = await item.getType(type);
+              const dataUrl = await new Promise((resolve) => {
                 const reader = new FileReader();
-                reader.onload = () => {{
-                  const dataUrl = reader.result; // data:image/png;base64,...
-                  const payload = {{
-                    key: "{key}",
-                    dataUrl: dataUrl
-                  }};
-                  window.parent.postMessage({{ isStreamlitMessage: true, type: "streamlit:setComponentValue", value: payload }}, "*");
-                  status.textContent = "Image pasted.";
-                }};
+                reader.onload = () => resolve(reader.result);
                 reader.readAsDataURL(blob);
-                return;
-              }}
-            }}
-          }}
-          status.textContent = "No image in clipboard.";
-        }} catch (e) {{
-          status.textContent = "Paste blocked by browser permissions.";
-        }}
-      }}
-
-      btn.addEventListener("click", readClipboardImage);
-    </script>
+              });
+              return dataUrl;
+            }
+          }
+        }
+        return null;
+      } catch (e) {
+        return "ERROR:" + e.toString();
+      }
+    }
     """
-    payload = components.html(html, height=50, key=f"paste_component_{key}")
-    if payload and isinstance(payload, dict) and payload.get("key") == key:
-        st.session_state[key] = payload.get("dataUrl")
-
-
-def dataurl_to_bytes(data_url: str):
-    if not data_url or "," not in data_url:
+    data_url = streamlit_js_eval(js_expressions=js, key=button_key, want_output=True)
+    if not data_url:
         return None
-    header, b64 = data_url.split(",", 1)
-    return base64.b64decode(b64)
+    if isinstance(data_url, str) and data_url.startswith("ERROR:"):
+        st.warning("Clipboard read blocked by browser permission/policy.")
+        return None
+    if isinstance(data_url, str) and data_url.startswith("data:image/") and "," in data_url:
+        b64 = data_url.split(",", 1)[1]
+        return base64.b64decode(b64)
+    return None
+
+
+def uploaded_file_to_bytes(uploaded):
+    return uploaded.getvalue() if uploaded else None
 
 
 # -----------------------------
 # UI
 # -----------------------------
 st.set_page_config(page_title="MOP Automation", layout="wide")
-st.title("MOP Automation (Streamlit)")
+st.title("MOP Automation (Streamlit Cloud)")
 
-with st.sidebar:
-    st.write("Template file required: `Template.docx` in the repo root.")
+if not os.path.exists(TEMPLATE_FILE):
+    st.error("Template.docx not found in repo root. Upload/commit Template.docx next to app.py.")
+    st.stop()
 
 col1, col2 = st.columns(2)
 
 with col1:
-    site_name = st.text_input("Site Name", value="")
-    plaid = st.text_input("Plaid", value="")
+    site_name = st.text_input("Site Name")
+    plaid = st.text_input("Plaid")
     equipment = st.text_input("Equipment", value="Nokia Lightspan MF-2")
-    olt_label_custom = st.text_input("Custom OLT Label (if not Nokia MF-2)", value="")
-    prepared_by = st.text_input("Prepared By", value="")
+    olt_label_custom = st.text_input("Custom OLT Label (if not Nokia MF-2)")
+    prepared_by = st.text_input("Prepared By")
     position = st.text_input("Position", value="OLT Rollout Engineer")
     target_datetime = st.text_input("Target Date and Time", value="May 19- June 19, 2026 10:00AM-6:00PM")
 
 with col2:
-    rs1_rectifier_name = st.text_input("RS1 Rectifier Name", value="")
-    rs1_load_assignment = st.text_input("RS1 Load Assignment", value="")
-    rs2_rectifier_name = st.text_input("RS2 Rectifier Name", value="")
-    rs2_load_assignment = st.text_input("RS2 Load Assignment", value="")
+    rs1_rectifier_name = st.text_input("RS1 Rectifier Name")
+    rs1_load_assignment = st.text_input("RS1 Load Assignment")
+    rs2_rectifier_name = st.text_input("RS2 Rectifier Name")
+    rs2_load_assignment = st.text_input("RS2 Load Assignment")
 
 st.divider()
-
 st.subheader("Images / Attachments")
 
 c1, c2, c3 = st.columns(3)
@@ -342,36 +327,37 @@ c1, c2, c3 = st.columns(3)
 with c1:
     st.markdown("### RS1 Image")
     rs1_upload = st.file_uploader("Upload RS1 image", type=["png", "jpg", "jpeg", "bmp"], key="rs1_upload")
-    paste_image_widget("rs1_paste_dataurl", "Paste RS1 from clipboard")
-    rs1_pasted_bytes = dataurl_to_bytes(st.session_state.get("rs1_paste_dataurl", ""))
-    if rs1_upload:
-        st.image(rs1_upload, caption="RS1 uploaded", use_container_width=True)
-    elif rs1_pasted_bytes:
-        st.image(rs1_pasted_bytes, caption="RS1 pasted", use_container_width=True)
+    if st.button("Paste RS1 from clipboard", key="paste_rs1_btn"):
+        st.session_state["rs1_clip_bytes"] = clipboard_image_to_bytes("rs1_clip_eval")
+
+    rs1_clip_bytes = st.session_state.get("rs1_clip_bytes")
+    rs1_img_bytes = uploaded_file_to_bytes(rs1_upload) or rs1_clip_bytes
+    if rs1_img_bytes:
+        st.image(rs1_img_bytes, caption="RS1 image", use_container_width=True)
 
 with c2:
     st.markdown("### RS2 Image")
     rs2_upload = st.file_uploader("Upload RS2 image", type=["png", "jpg", "jpeg", "bmp"], key="rs2_upload")
-    paste_image_widget("rs2_paste_dataurl", "Paste RS2 from clipboard")
-    rs2_pasted_bytes = dataurl_to_bytes(st.session_state.get("rs2_paste_dataurl", ""))
-    if rs2_upload:
-        st.image(rs2_upload, caption="RS2 uploaded", use_container_width=True)
-    elif rs2_pasted_bytes:
-        st.image(rs2_pasted_bytes, caption="RS2 pasted", use_container_width=True)
+    if st.button("Paste RS2 from clipboard", key="paste_rs2_btn"):
+        st.session_state["rs2_clip_bytes"] = clipboard_image_to_bytes("rs2_clip_eval")
+
+    rs2_clip_bytes = st.session_state.get("rs2_clip_bytes")
+    rs2_img_bytes = uploaded_file_to_bytes(rs2_upload) or rs2_clip_bytes
+    if rs2_img_bytes:
+        st.image(rs2_img_bytes, caption="RS2 image", use_container_width=True)
 
 with c3:
     st.markdown("### Existing Rectifier (Page 8)")
-    rectifier_upload = st.file_uploader("Upload rectifier image", type=["png", "jpg", "jpeg", "bmp"], key="rect_upload")
-    paste_image_widget("rectifier_paste_dataurl", "Paste Rectifier from clipboard")
-    rect_pasted_bytes = dataurl_to_bytes(st.session_state.get("rectifier_paste_dataurl", ""))
-    if rectifier_upload:
-        st.image(rectifier_upload, caption="Rectifier uploaded", use_container_width=True)
-    elif rect_pasted_bytes:
-        st.image(rect_pasted_bytes, caption="Rectifier pasted", use_container_width=True)
+    rect_upload = st.file_uploader("Upload rectifier image", type=["png", "jpg", "jpeg", "bmp"], key="rect_upload")
+    if st.button("Paste Rectifier from clipboard", key="paste_rect_btn"):
+        st.session_state["rect_clip_bytes"] = clipboard_image_to_bytes("rect_clip_eval")
 
-tssr_pdf = st.file_uploader("TSSR PDF (uploaded for reference; filename inserted into Word)", type=["pdf"], key="tssr_pdf")
+    rect_clip_bytes = st.session_state.get("rect_clip_bytes")
+    rect_img_bytes = uploaded_file_to_bytes(rect_upload) or rect_clip_bytes
+    if rect_img_bytes:
+        st.image(rect_img_bytes, caption="Existing rectifier image", use_container_width=True)
 
-st.divider()
+tssr_pdf = st.file_uploader("TSSR PDF (filename will be written into Word)", type=["pdf"], key="tssr_pdf")
 
 data = {
     "site_name": site_name.strip(),
@@ -393,15 +379,7 @@ required = [
     "rs2_rectifier_name", "rs2_load_assignment"
 ]
 
-def uploaded_file_to_bytes(uploaded):
-    if not uploaded:
-        return None
-    return uploaded.getvalue()
-
-rs1_img_bytes = uploaded_file_to_bytes(rs1_upload) or rs1_pasted_bytes
-rs2_img_bytes = uploaded_file_to_bytes(rs2_upload) or rs2_pasted_bytes
-rectifier_img_bytes = uploaded_file_to_bytes(rectifier_upload) or rect_pasted_bytes
-tssr_pdf_name = tssr_pdf.name if tssr_pdf else ""
+st.divider()
 
 if st.button("Generate MOP (.docx)", type="primary"):
     missing = [k for k in required if not data.get(k)]
@@ -410,20 +388,18 @@ if st.button("Generate MOP (.docx)", type="primary"):
     else:
         try:
             docx_bytes = generate_docx_bytes(
-                data,
+                data=data,
                 rs1_img_bytes=rs1_img_bytes,
                 rs2_img_bytes=rs2_img_bytes,
-                rectifier_img_bytes=rectifier_img_bytes,
-                tssr_pdf_name=tssr_pdf_name
+                rectifier_img_bytes=rect_img_bytes,
+                tssr_pdf_name=(tssr_pdf.name if tssr_pdf else "")
             )
-
             out_name = f"MOP_{safe_filename(data['site_name'])}_{safe_filename(data['plaid'])}.docx"
-            st.success("Generated.")
             st.download_button(
                 "Download MOP",
                 data=docx_bytes,
                 file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             )
         except Exception as e:
             st.exception(e)
