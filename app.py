@@ -349,3 +349,72 @@ rs_entries.append({"name": rs1_name.strip(), "load": rs1_load.strip(), "img_byte
 
 if rs_count == 2:
     st.markdown("### RS2")
+    rs2_name = st.text_input("RS2 Rectifier Name", key="rs2_name")
+    rs2_load = st.text_input("RS2 Load Assignment", key="rs2_load")
+    rs2_upload = st.file_uploader("Upload RS2 image", type=["png", "jpg", "jpeg", "bmp"], key="rs2_upload")
+    if st.button("Paste RS2 from clipboard", key="paste_rs2_btn"):
+        st.session_state["rs2_clip_bytes"] = clipboard_image_to_bytes("rs2_clip_eval")
+    rs2_img_bytes = uploaded_file_to_bytes(rs2_upload) or st.session_state.get("rs2_clip_bytes")
+    if rs2_img_bytes:
+        st.image(rs2_img_bytes, caption="RS2 image", width=260)
+
+    rs_entries.append({"name": rs2_name.strip(), "load": rs2_load.strip(), "img_bytes": rs2_img_bytes})
+
+st.divider()
+st.subheader("Other Attachments")
+
+rect_upload = st.file_uploader("Existing Rectifier image (page 8)", type=["png", "jpg", "jpeg", "bmp"], key="rect_upload")
+if st.button("Paste Rectifier from clipboard", key="paste_rect_btn"):
+    st.session_state["rect_clip_bytes"] = clipboard_image_to_bytes("rect_clip_eval")
+rect_img_bytes = uploaded_file_to_bytes(rect_upload) or st.session_state.get("rect_clip_bytes")
+if rect_img_bytes:
+    st.image(rect_img_bytes, caption="Existing rectifier", width=300)
+
+tssr_pdf = st.file_uploader("TSSR PDF (filename will be written into Word)", type=["pdf"], key="tssr_pdf")
+
+data = {
+    "site_name": site_name.strip(),
+    "plaid": plaid.strip(),
+    "equipment": equipment.strip(),
+    "olt_label_custom": olt_label_custom.strip(),
+    "prepared_by": prepared_by.strip(),
+    "position": position.strip(),
+    "target_datetime": target_datetime.strip(),
+}
+
+# Validation
+required_base = ["site_name", "plaid", "equipment", "prepared_by", "position", "target_datetime"]
+required_rs = ["name", "load"]
+
+if st.button("Generate MOP (.docx)", type="primary"):
+    missing = [k for k in required_base if not data.get(k)]
+    if missing:
+        st.error("Missing fields: " + ", ".join(missing))
+        st.stop()
+
+    # RS validation based on count
+    for i, rs in enumerate(rs_entries, start=1):
+        if i > rs_count:
+            continue
+        if not rs.get("name") or not rs.get("load"):
+            st.error(f"Missing RS{i} Rectifier Name or Load Assignment.")
+            st.stop()
+
+    try:
+        docx_bytes, rect_note = generate_docx_bytes(
+            data=data,
+            rs_entries=rs_entries[:rs_count],
+            rectifier_img_bytes=rect_img_bytes,
+            tssr_pdf_name=(tssr_pdf.name if tssr_pdf else "")
+        )
+
+        out_name = f"MOP_{safe_filename(data['site_name'])}_{safe_filename(data['plaid'])}.docx"
+        st.success("Generated. " + rect_note)
+        st.download_button(
+            "Download MOP",
+            data=docx_bytes,
+            file_name=out_name,
+            mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+        )
+    except Exception as e:
+        st.exception(e)
