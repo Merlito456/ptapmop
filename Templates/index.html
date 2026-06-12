@@ -1,0 +1,97 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>MOP Automation</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="container">
+    <h1>MOP Automation</h1>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for category, message in messages %}
+          <div class="alert {{ category }}">{{ message }}</div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" enctype="multipart/form-data">
+      <div class="grid">
+        <label>Site Name</label>
+        <input type="text" name="site_name" required>
+
+        <label>Plaid</label>
+        <input type="text" name="plaid" required>
+
+        <label>Equipment</label>
+        <input type="text" name="equipment" value="Nokia Lightspan MF-2" required>
+
+        <label>Custom OLT Label</label>
+        <input type="text" name="olt_label_custom">
+
+        <label>Prepared By</label>
+        <input type="text" name="prepared_by" required>
+
+        <label>Position</label>
+        <input type="text" name="position" value="OLT Rollout Engineer" required>
+
+        <label>Target Date and Time</label>
+        <input type="text" name="target_datetime" value="May 19- June 19, 2026 10:00AM-6:00PM" required>
+
+        <label>RS1 Rectifier Name</label>
+        <input type="text" name="rs1_rectifier_name" required>
+
+        <label>RS1 Load Assignment</label>
+        <input type="text" name="rs1_load_assignment" required>
+
+        <label>RS2 Rectifier Name</label>
+        <input type="text" name="rs2_rectifier_name" required>
+
+        <label>RS2 Load Assignment</label>
+        <input type="text" name="rs2_load_assignment" required>
+
+        <label>RS1 Image Upload</label>
+        <input type="file" name="rs1_image" accept="image/*">
+
+        <label>RS1 Paste Preview</label>
+        <div>
+          <button type="button" onclick="pasteImage('rs1')">Paste RS1 Image</button>
+          <input type="hidden" name="rs1_image_paste" id="rs1_image_paste">
+          <div><img id="rs1_preview" class="preview"></div>
+        </div>
+
+        <label>RS2 Image Upload</label>
+        <input type="file" name="rs2_image" accept="image/*">
+
+        <label>RS2 Paste Preview</label>
+        <div>
+          <button type="button" onclick="pasteImage('rs2')">Paste RS2 Image</button>
+          <input type="hidden" name="rs2_image_paste" id="rs2_image_paste">
+          <div><img id="rs2_preview" class="preview"></div>
+        </div>
+
+        <label>Rectifier Image Upload</label>
+        <input type="file" name="rectifier_image_page8" accept="image/*">
+
+        <label>Rectifier Paste Preview</label>
+        <div>
+          <button type="button" onclick="pasteImage('rectifier')">Paste Rectifier Image</button>
+          <input type="hidden" name="rectifier_image_paste" id="rectifier_image_paste">
+          <div><img id="rectifier_preview" class="preview"></div>
+        </div>
+
+        <label>TSSR PDF</label>
+        <input type="file" name="tssr_pdf" accept=".pdf">
+      </div>
+
+      <div class="actions">
+        <button type="submit">Generate MOP</button>
+      </div>
+    </form>
+  </div>
+
+  <script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>

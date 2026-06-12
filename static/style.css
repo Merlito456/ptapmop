@@ -1,0 +1,60 @@
+body {
+  font-family: Arial, sans-serif;
+  background: #f3f5f7;
+  margin: 0;
+  padding: 20px;
+}
+
+.container {
+  max-width: 1000px;
+  margin: auto;
+  background: white;
+  padding: 24px;
+  border-radius: 10px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.08);
+}
+
+h1 {
+  margin-top: 0;
+}
+
+.grid {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  gap: 12px 16px;
+  align-items: center;
+}
+
+input[type="text"],
+input[type="file"] {
+  width: 100%;
+  padding: 8px;
+  box-sizing: border-box;
+}
+
+.actions {
+  margin-top: 24px;
+}
+
+button {
+  padding: 10px 16px;
+  cursor: pointer;
+}
+
+.preview {
+  max-width: 250px;
+  max-height: 180px;
+  margin-top: 8px;
+  border: 1px solid #ccc;
+}
+
+.alert {
+  padding: 10px;
+  border-radius: 6px;
+  margin-bottom: 12px;
+}
+
+.alert.error {
+  background: #ffe3e3;
+  color: #8a1c1c;
+}
