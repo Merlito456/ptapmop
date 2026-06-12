@@ -87,7 +87,6 @@ def find_any_anchor(doc, needles):
     p = find_paragraph_by_contains(doc, needles)
     if p:
         return p, "body"
-
     for i, section in enumerate(doc.sections):
         p = find_paragraph_by_contains(section.header, needles)
         if p:
@@ -95,7 +94,6 @@ def find_any_anchor(doc, needles):
         p = find_paragraph_by_contains(section.footer, needles)
         if p:
             return p, f"footer_{i}"
-
     return None, None
 
 
@@ -171,7 +169,12 @@ def build_fuse_line(olt_label: str, equipment: str) -> str:
     return f"FUSE No: L3 {olt_label} – ({normalize_spaces(equipment)} Power tapping point)"
 
 
-def insert_power_section_content(doc, data, rs1_img_bytes, rs2_img_bytes):
+def insert_power_section_content(doc, data, rs_entries):
+    """
+    rs_entries: list of dicts like:
+      {"name": "...", "load": "...", "img_bytes": b"..."}
+    Inserts only the number of RS provided.
+    """
     fuse_variants = [
         "FUSE No: L3 Nokia OLT MF-2 – ( Nokia Power tapping point)",
         "FUSE No: L3 Nokia OLT MF-2 – (Nokia Power tapping point)",
@@ -185,40 +188,55 @@ def insert_power_section_content(doc, data, rs1_img_bytes, rs2_img_bytes):
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
     set_paragraph_text(anchor, build_fuse_line(olt_label, data["equipment"]))
 
-    rs1_line = f"RS1 + {data['rs1_rectifier_name']} + {data['rs1_load_assignment']}"
-    rs2_line = f"RS2 + {data['rs2_rectifier_name']} + {data['rs2_load_assignment']}"
-
-    p1 = insert_paragraph_after(anchor, rs1_line)
-    last = p1
-    if rs1_img_bytes:
-        img_p, _ = insert_image_after(p1, rs1_img_bytes, width=Inches(4.5), caption="RS1")
-        last = img_p
-
-    p2 = insert_paragraph_after(last, rs2_line)
-    if rs2_img_bytes:
-        insert_image_after(p2, rs2_img_bytes, width=Inches(4.5), caption="RS2")
+    last = anchor
+    for idx, rs in enumerate(rs_entries, start=1):
+        line = f"RS{idx} + {rs['name']} + {rs['load']}"
+        p = insert_paragraph_after(last, line)
+        last = p
+        if rs.get("img_bytes"):
+            img_p, _ = insert_image_after(p, rs["img_bytes"], width=Inches(4.5), caption=f"RS{idx}")
+            last = img_p
 
 
 def insert_supporting_documents(doc, tssr_pdf_name: str):
     if not tssr_pdf_name:
         return
-    anchor, _ = find_any_anchor(doc, ["Supporting Documents"])
+
+    anchor, _ = find_any_anchor(doc, ["Supporting Documents", "Supporting Document", "Attachments"])
     if not anchor:
-        raise ValueError("Could not find 'Supporting Documents' section.")
-    p = insert_paragraph_after(anchor, f"TSSR: {tssr_pdf_name}")
-    # If you have a URL, we can hyperlink it instead.
+        # fallback: append at end
+        anchor = doc.paragraphs[-1] if doc.paragraphs else doc.add_paragraph("")
+
+    insert_paragraph_after(anchor, f"TSSR: {tssr_pdf_name}")
 
 
 def insert_existing_rectifier_image(doc, rectifier_img_bytes):
     if not rectifier_img_bytes:
-        return
-    anchor, _ = find_any_anchor(doc, ["Existing Rectifier"])
+        return "No rectifier image provided."
+
+    # More flexible anchors (edit this list to match your template wording)
+    rect_anchors = [
+        "Existing Rectifier",
+        "Rectifier",
+        "RECTIFIER",
+        "Rectifier Photo",
+        "Photo of Rectifier",
+        "Existing DC Plant",
+    ]
+
+    anchor, where = find_any_anchor(doc, rect_anchors)
     if not anchor:
-        raise ValueError("Could not find 'Existing Rectifier' section.")
+        # Fallback: insert near the end instead of erroring out
+        anchor = doc.paragraphs[-1] if doc.paragraphs else doc.add_paragraph("")
+        insert_paragraph_after(anchor, "Existing Rectifier (Auto-inserted):")
+        insert_image_after(anchor, rectifier_img_bytes, width=Inches(5.0), caption="Existing Rectifier")
+        return "Rectifier anchor not found; image inserted at end of document."
+
     insert_image_after(anchor, rectifier_img_bytes, width=Inches(5.0), caption="Existing Rectifier")
+    return f"Rectifier image inserted under anchor found in {where}."
 
 
-def generate_docx_bytes(data, rs1_img_bytes, rs2_img_bytes, rectifier_img_bytes, tssr_pdf_name):
+def generate_docx_bytes(data, rs_entries, rectifier_img_bytes, tssr_pdf_name):
     if not os.path.exists(TEMPLATE_FILE):
         raise FileNotFoundError(f"Template file not found: {TEMPLATE_FILE}")
 
@@ -235,24 +253,20 @@ def generate_docx_bytes(data, rs1_img_bytes, rs2_img_bytes, rectifier_img_bytes,
     }
     replace_everywhere(doc, replacements)
 
-    insert_power_section_content(doc, data, rs1_img_bytes, rs2_img_bytes)
+    insert_power_section_content(doc, data, rs_entries)
     insert_supporting_documents(doc, tssr_pdf_name)
-    insert_existing_rectifier_image(doc, rectifier_img_bytes)
+    rect_note = insert_existing_rectifier_image(doc, rectifier_img_bytes)
 
     out = io.BytesIO()
     doc.save(out)
     out.seek(0)
-    return out.getvalue()
+    return out.getvalue(), rect_note
 
 
 # -----------------------------
 # Clipboard via streamlit-js-eval
 # -----------------------------
-def clipboard_image_to_bytes(button_key: str):
-    """
-    Returns bytes if clipboard has an image, else None.
-    Requires user click.
-    """
+def clipboard_image_to_bytes(eval_key: str):
     js = """
     async () => {
       try {
@@ -276,7 +290,7 @@ def clipboard_image_to_bytes(button_key: str):
       }
     }
     """
-    data_url = streamlit_js_eval(js_expressions=js, key=button_key, want_output=True)
+    data_url = streamlit_js_eval(js_expressions=js, key=eval_key, want_output=True)
     if not data_url:
         return None
     if isinstance(data_url, str) and data_url.startswith("ERROR:"):
@@ -299,7 +313,7 @@ st.set_page_config(page_title="MOP Automation", layout="wide")
 st.title("MOP Automation (Streamlit Cloud)")
 
 if not os.path.exists(TEMPLATE_FILE):
-    st.error("Template.docx not found in repo root. Upload/commit Template.docx next to app.py.")
+    st.error("Template.docx not found in repo root. Commit Template.docx next to app.py.")
     st.stop()
 
 col1, col2 = st.columns(2)
@@ -314,92 +328,24 @@ with col1:
     target_datetime = st.text_input("Target Date and Time", value="May 19- June 19, 2026 10:00AM-6:00PM")
 
 with col2:
-    rs1_rectifier_name = st.text_input("RS1 Rectifier Name")
-    rs1_load_assignment = st.text_input("RS1 Load Assignment")
-    rs2_rectifier_name = st.text_input("RS2 Rectifier Name")
-    rs2_load_assignment = st.text_input("RS2 Load Assignment")
+    rs_count = st.selectbox("Number of RS", options=[1, 2], index=1)
 
 st.divider()
-st.subheader("Images / Attachments")
+st.subheader("RS Details")
 
-c1, c2, c3 = st.columns(3)
+rs_entries = []
 
-with c1:
-    st.markdown("### RS1 Image")
-    rs1_upload = st.file_uploader("Upload RS1 image", type=["png", "jpg", "jpeg", "bmp"], key="rs1_upload")
-    if st.button("Paste RS1 from clipboard", key="paste_rs1_btn"):
-        st.session_state["rs1_clip_bytes"] = clipboard_image_to_bytes("rs1_clip_eval")
+st.markdown("### RS1")
+rs1_name = st.text_input("RS1 Rectifier Name", key="rs1_name")
+rs1_load = st.text_input("RS1 Load Assignment", key="rs1_load")
+rs1_upload = st.file_uploader("Upload RS1 image", type=["png", "jpg", "jpeg", "bmp"], key="rs1_upload")
+if st.button("Paste RS1 from clipboard", key="paste_rs1_btn"):
+    st.session_state["rs1_clip_bytes"] = clipboard_image_to_bytes("rs1_clip_eval")
+rs1_img_bytes = uploaded_file_to_bytes(rs1_upload) or st.session_state.get("rs1_clip_bytes")
+if rs1_img_bytes:
+    st.image(rs1_img_bytes, caption="RS1 image", width=260)
 
-    rs1_clip_bytes = st.session_state.get("rs1_clip_bytes")
-    rs1_img_bytes = uploaded_file_to_bytes(rs1_upload) or rs1_clip_bytes
-    if rs1_img_bytes:
-        st.image(rs1_img_bytes, caption="RS1 image", use_container_width=True)
+rs_entries.append({"name": rs1_name.strip(), "load": rs1_load.strip(), "img_bytes": rs1_img_bytes})
 
-with c2:
-    st.markdown("### RS2 Image")
-    rs2_upload = st.file_uploader("Upload RS2 image", type=["png", "jpg", "jpeg", "bmp"], key="rs2_upload")
-    if st.button("Paste RS2 from clipboard", key="paste_rs2_btn"):
-        st.session_state["rs2_clip_bytes"] = clipboard_image_to_bytes("rs2_clip_eval")
-
-    rs2_clip_bytes = st.session_state.get("rs2_clip_bytes")
-    rs2_img_bytes = uploaded_file_to_bytes(rs2_upload) or rs2_clip_bytes
-    if rs2_img_bytes:
-        st.image(rs2_img_bytes, caption="RS2 image", use_container_width=True)
-
-with c3:
-    st.markdown("### Existing Rectifier (Page 8)")
-    rect_upload = st.file_uploader("Upload rectifier image", type=["png", "jpg", "jpeg", "bmp"], key="rect_upload")
-    if st.button("Paste Rectifier from clipboard", key="paste_rect_btn"):
-        st.session_state["rect_clip_bytes"] = clipboard_image_to_bytes("rect_clip_eval")
-
-    rect_clip_bytes = st.session_state.get("rect_clip_bytes")
-    rect_img_bytes = uploaded_file_to_bytes(rect_upload) or rect_clip_bytes
-    if rect_img_bytes:
-        st.image(rect_img_bytes, caption="Existing rectifier image", use_container_width=True)
-
-tssr_pdf = st.file_uploader("TSSR PDF (filename will be written into Word)", type=["pdf"], key="tssr_pdf")
-
-data = {
-    "site_name": site_name.strip(),
-    "plaid": plaid.strip(),
-    "equipment": equipment.strip(),
-    "olt_label_custom": olt_label_custom.strip(),
-    "prepared_by": prepared_by.strip(),
-    "position": position.strip(),
-    "target_datetime": target_datetime.strip(),
-    "rs1_rectifier_name": rs1_rectifier_name.strip(),
-    "rs1_load_assignment": rs1_load_assignment.strip(),
-    "rs2_rectifier_name": rs2_rectifier_name.strip(),
-    "rs2_load_assignment": rs2_load_assignment.strip(),
-}
-
-required = [
-    "site_name", "plaid", "equipment", "prepared_by", "position",
-    "target_datetime", "rs1_rectifier_name", "rs1_load_assignment",
-    "rs2_rectifier_name", "rs2_load_assignment"
-]
-
-st.divider()
-
-if st.button("Generate MOP (.docx)", type="primary"):
-    missing = [k for k in required if not data.get(k)]
-    if missing:
-        st.error("Missing fields: " + ", ".join(missing))
-    else:
-        try:
-            docx_bytes = generate_docx_bytes(
-                data=data,
-                rs1_img_bytes=rs1_img_bytes,
-                rs2_img_bytes=rs2_img_bytes,
-                rectifier_img_bytes=rect_img_bytes,
-                tssr_pdf_name=(tssr_pdf.name if tssr_pdf else "")
-            )
-            out_name = f"MOP_{safe_filename(data['site_name'])}_{safe_filename(data['plaid'])}.docx"
-            st.download_button(
-                "Download MOP",
-                data=docx_bytes,
-                file_name=out_name,
-                mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
-            )
-        except Exception as e:
-            st.exception(e)
+if rs_count == 2:
+    st.markdown("### RS2")
