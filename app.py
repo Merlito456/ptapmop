@@ -15,13 +15,11 @@ from streamlit_js_eval import streamlit_js_eval
 
 
 TEMPLATE_FILE = "Template.docx"
-
-# XML namespaces used in Word documents
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
 # =============================================================
-# DOCX LOW-LEVEL HELPERS
+# DOCX HELPERS
 # =============================================================
 
 def normalize_spaces(s: str) -> str:
@@ -34,7 +32,6 @@ def safe_filename(s: str) -> str:
 
 
 def iter_all_paragraphs(container):
-    """Yield all paragraphs in body/table cells recursively."""
     for p in container.paragraphs:
         yield p
     for t in container.tables:
@@ -48,7 +45,6 @@ def paragraph_full_text(paragraph) -> str:
 
 
 def set_paragraph_text(paragraph, text: str):
-    """Replace paragraph text preserving first run formatting."""
     for i, run in enumerate(paragraph.runs):
         run.text = text if i == 0 else ""
     if not paragraph.runs:
@@ -56,24 +52,17 @@ def set_paragraph_text(paragraph, text: str):
 
 
 def replace_text_in_paragraph_preserve_format(paragraph, replacements: dict):
-    """
-    Replace text in paragraph that may be split across multiple runs.
-    Preserves first run formatting (bold, italic, underline, color, font).
-    """
     full = paragraph_full_text(paragraph)
     if not full.strip():
         return
-
     new_full = full
     changed = False
     for old, new in replacements.items():
         if old and old in new_full:
             new_full = new_full.replace(old, new)
             changed = True
-
     if not changed:
         return
-
     if paragraph.runs:
         first_run = paragraph.runs[0]
         bold      = first_run.bold
@@ -89,10 +78,8 @@ def replace_text_in_paragraph_preserve_format(paragraph, replacements: dict):
             )
         except Exception:
             font_color = None
-
         for run in paragraph.runs:
             run.text = ""
-
         first_run.text      = new_full
         first_run.bold      = bold
         first_run.italic    = italic
@@ -115,22 +102,7 @@ def replace_text_in_container(container, replacements: dict):
         replace_text_in_paragraph_preserve_format(p, replacements)
 
 
-# =============================================================
-# RAW XML TEXT REPLACEMENT (for headers/footers with textboxes)
-# =============================================================
-
 def replace_in_xml_text_nodes(xml_element, replacements: dict):
-    """
-    Walk ALL <w:t> nodes in the XML tree and do plain string replacement.
-    This reaches text inside:
-    - text boxes  (<w:txbxContent>)
-    - drawings
-    - shapes
-    - anything python-docx .paragraphs doesn't expose
-
-    Note: this does NOT handle text split across runs.
-    For split-run text in headers, we also run the run-reconstruction approach.
-    """
     ns = WORD_NS
     for t_node in xml_element.iter(f"{{{ns}}}t"):
         if t_node.text:
@@ -143,26 +115,12 @@ def replace_in_xml_text_nodes(xml_element, replacements: dict):
 
 
 def replace_everywhere(doc, replacements: dict):
-    """
-    Replace text in:
-    1. Body paragraphs + table cells (run-aware, format-preserving)
-    2. Header/footer via python-docx paragraph access
-    3. Header/footer raw XML (catches textboxes, drawings, shapes)
-    """
-    # 1. Body
     replace_text_in_container(doc, replacements)
-
-    # 2 & 3. All sections headers/footers
     for section in doc.sections:
-        # python-docx paragraph access (tables, plain paragraphs)
         replace_text_in_container(section.header, replacements)
         replace_text_in_container(section.footer, replacements)
-
-        # Raw XML access (textboxes, drawings, shapes)
         replace_in_xml_text_nodes(section.header._element, replacements)
         replace_in_xml_text_nodes(section.footer._element, replacements)
-
-        # Even/first page headers if present
         try:
             replace_text_in_container(section.even_page_header, replacements)
             replace_in_xml_text_nodes(
@@ -176,10 +134,6 @@ def replace_everywhere(doc, replacements: dict):
         except Exception:
             pass
 
-
-# =============================================================
-# FIND PARAGRAPH HELPERS
-# =============================================================
 
 def find_paragraph_containing(container, needles: list,
                                case_insensitive=True):
@@ -215,18 +169,9 @@ def insert_paragraph_after(ref_paragraph, text=""):
     return new_para
 
 
-# =============================================================
-# IMAGE PLACEHOLDER REPLACEMENT
-# =============================================================
-
 def replace_placeholder_with_image(doc, placeholders: list,
                                     image_bytes: bytes,
                                     width=Inches(5.0)):
-    """
-    Find paragraph containing any placeholder string,
-    clear it, insert image in-place.
-    Returns the matched placeholder or None.
-    """
     for p in iter_all_paragraphs(doc):
         full = paragraph_full_text(p)
         for ph in placeholders:
@@ -245,10 +190,6 @@ def clear_placeholders(doc, placeholders: list):
     mapping = {ph: "" for ph in placeholders}
     replace_everywhere(doc, mapping)
 
-
-# =============================================================
-# HYPERLINK HELPER
-# =============================================================
 
 def add_hyperlink(paragraph, text: str, url: str,
                   color="0000FF", underline=True):
@@ -276,25 +217,15 @@ def add_hyperlink(paragraph, text: str, url: str,
 
 
 # =============================================================
-# DEBUG HELPER
+# DEBUG
 # =============================================================
 
 def debug_list_all_text(doc) -> list:
-    """
-    List all text from:
-    - body paragraphs + table cells
-    - header/footer paragraphs + table cells
-    - header/footer raw XML <w:t> nodes (catches textboxes)
-    """
     lines = []
-
-    # Body
     for p in iter_all_paragraphs(doc):
         txt = paragraph_full_text(p).strip()
         if txt:
             lines.append(f"[BODY] {txt}")
-
-    # Headers / footers via python-docx
     for i, section in enumerate(doc.sections):
         for p in iter_all_paragraphs(section.header):
             txt = paragraph_full_text(p).strip()
@@ -304,10 +235,7 @@ def debug_list_all_text(doc) -> list:
             txt = paragraph_full_text(p).strip()
             if txt:
                 lines.append(f"[FOOTER s{i}] {txt}")
-
-    # Headers / footers via raw XML (textboxes, shapes)
-    ns = WORD_NS
-    for i, section in enumerate(doc.sections):
+        ns = WORD_NS
         for t_node in section.header._element.iter(f"{{{ns}}}t"):
             txt = (t_node.text or "").strip()
             if txt:
@@ -316,7 +244,6 @@ def debug_list_all_text(doc) -> list:
             txt = (t_node.text or "").strip()
             if txt:
                 lines.append(f"[FOOTER-XML s{i}] {txt}")
-
     return lines
 
 
@@ -330,21 +257,18 @@ RS1_LOAD_PH = [
     "{{RS1 load schedule image}}",
     "{{RS1 load schedule image}",
 ]
-
 RS2_LOAD_PH = [
     "{{RS2 Load schedule image}}",
     "{{RS2 Load schedule image}",
     "{{RS2 load schedule image}}",
     "{{RS2 load schedule image}",
 ]
-
 RS1_EXIST_PH = [
     "{{RS1 EXISTING IMAGE}}",
     "{{RS1 EXISTING IMAGE}",
     "{{RS1 existing image}}",
     "{{RS1 existing image}",
 ]
-
 RS2_EXIST_PH = [
     "{{RS2 EXISTING IMAGE}}",
     "{{RS2 EXISTING IMAGE}",
@@ -363,9 +287,14 @@ def build_olt_label(equipment: str, custom_olt_label: str) -> str:
     return normalize_spaces(custom_olt_label) or normalize_spaces(equipment)
 
 
-def build_fuse_line(fuse_no: str, olt_label: str, equipment: str) -> str:
+def build_fuse_line(load: str, olt_label: str, equipment: str) -> str:
+    """
+    load = Load Assignment = Fuse No (e.g. F8, L3, L6)
+    Produces:
+      FUSE No: F8 OLT MF-2 – (Nokia Lightspan MF-2 Power tapping point)
+    """
     return (
-        f"FUSE No: {fuse_no} {olt_label} "
+        f"FUSE No: {load} {olt_label} "
         f"– ({normalize_spaces(equipment)} Power tapping point)"
     )
 
@@ -377,7 +306,9 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
     rs1 = rs_entries[0] if len(rs_entries) > 0 else None
     rs2 = rs_entries[1] if len(rs_entries) > 1 else None
 
-    # A. PROPOSED RECTIFIER SYSTEM headers
+    # ----------------------------------------------------------
+    # A. "PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE" headers
+    # ----------------------------------------------------------
     rectifier_header_paras = []
     for p in iter_all_paragraphs(doc):
         if "PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE" in paragraph_full_text(p).upper():
@@ -399,19 +330,28 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
         else:
             set_paragraph_text(rectifier_header_paras[1], "")
 
+    # ----------------------------------------------------------
     # B. RS1 FUSE line
+    #    Template: "FUSE No: {{load}}+ Equipment –(Nokia Power tapping point)"
+    #    Uses rs1["load"] as the fuse number
+    # ----------------------------------------------------------
     rs1_fuse_para, _ = find_in_doc(doc, [
-        "{{load}}", "FUSE No: L3 Nokia OLT MF-2",
-        "FUSE No: L3 OLT MF-2", "FUSE No: L3",
+        "{{load}}",
         "{{load}}+ Equipment",
+        "FUSE No: L3 Nokia OLT MF-2",
+        "FUSE No: L3 OLT MF-2",
+        "FUSE No: L3",
     ])
     if rs1_fuse_para and rs1:
         set_paragraph_text(
             rs1_fuse_para,
-            build_fuse_line(rs1["fuse_no"], olt_label, equipment)
+            build_fuse_line(rs1["load"], olt_label, equipment)
         )
 
+    # ----------------------------------------------------------
     # C. RS2 FUSE line
+    #    Uses rs2["load"] as the fuse number
+    # ----------------------------------------------------------
     rs2_fuse_para, _ = find_in_doc(doc, [
         "FUSE No: L6 Nokia OLT MF-2",
         "FUSE No: L6 OLT MF-2",
@@ -421,34 +361,46 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
         if rs2:
             set_paragraph_text(
                 rs2_fuse_para,
-                build_fuse_line(rs2["fuse_no"], olt_label, equipment)
+                build_fuse_line(rs2["load"], olt_label, equipment)
             )
         else:
             set_paragraph_text(rs2_fuse_para, "")
 
+    # ----------------------------------------------------------
     # D. RS1 Load Schedule image
+    # ----------------------------------------------------------
     if rs1 and rs1.get("load_img_bytes"):
         matched = replace_placeholder_with_image(
             doc, RS1_LOAD_PH, rs1["load_img_bytes"], width=Inches(5.0))
         if matched:
             warnings.append(f"✅ RS1 Load Schedule image inserted (matched: '{matched}').")
         else:
-            warnings.append(f"⚠️ RS1 Load Schedule placeholder not found. Tried: {RS1_LOAD_PH}")
+            warnings.append(
+                f"⚠️ RS1 Load Schedule placeholder not found. "
+                f"Tried: {RS1_LOAD_PH}"
+            )
     else:
         clear_placeholders(doc, RS1_LOAD_PH)
 
+    # ----------------------------------------------------------
     # E. RS2 Load Schedule image
+    # ----------------------------------------------------------
     if rs2 and rs2.get("load_img_bytes"):
         matched = replace_placeholder_with_image(
             doc, RS2_LOAD_PH, rs2["load_img_bytes"], width=Inches(5.0))
         if matched:
             warnings.append(f"✅ RS2 Load Schedule image inserted (matched: '{matched}').")
         else:
-            warnings.append(f"⚠️ RS2 Load Schedule placeholder not found. Tried: {RS2_LOAD_PH}")
+            warnings.append(
+                f"⚠️ RS2 Load Schedule placeholder not found. "
+                f"Tried: {RS2_LOAD_PH}"
+            )
     else:
         clear_placeholders(doc, RS2_LOAD_PH)
 
+    # ----------------------------------------------------------
     # F. RS1 EXISTING IMAGE
+    # ----------------------------------------------------------
     if rs1 and rs1.get("existing_img_bytes"):
         matched = replace_placeholder_with_image(
             doc, RS1_EXIST_PH, rs1["existing_img_bytes"], width=Inches(5.0))
@@ -456,17 +408,22 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
             warnings.append(f"✅ RS1 Existing image inserted (matched: '{matched}').")
         else:
             warnings.append(
-                f"⚠️ RS1 EXISTING IMAGE placeholder not found. Tried: {RS1_EXIST_PH}")
+                f"⚠️ RS1 EXISTING IMAGE not found. Tried: {RS1_EXIST_PH}")
     else:
         clear_placeholders(doc, RS1_EXIST_PH)
 
     # RECTIFIER 1 caption
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 1":
-            set_paragraph_text(p, f"RECTIFIER 1 – {rs1['name']}" if rs1 else "")
+            set_paragraph_text(
+                p,
+                f"RECTIFIER 1 – {rs1['name']}" if rs1 else ""
+            )
             break
 
+    # ----------------------------------------------------------
     # G. RS2 EXISTING IMAGE
+    # ----------------------------------------------------------
     if rs2 and rs2.get("existing_img_bytes"):
         matched = replace_placeholder_with_image(
             doc, RS2_EXIST_PH, rs2["existing_img_bytes"], width=Inches(5.0))
@@ -474,15 +431,103 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
             warnings.append(f"✅ RS2 Existing image inserted (matched: '{matched}').")
         else:
             warnings.append(
-                f"⚠️ RS2 EXISTING IMAGE placeholder not found. Tried: {RS2_EXIST_PH}")
+                f"⚠️ RS2 EXISTING IMAGE not found. Tried: {RS2_EXIST_PH}")
     else:
         clear_placeholders(doc, RS2_EXIST_PH)
 
     # RECTIFIER 2 caption
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 2":
-            set_paragraph_text(p, f"RECTIFIER 2 – {rs2['name']}" if rs2 else "")
+            set_paragraph_text(
+                p,
+                f"RECTIFIER 2 – {rs2['name']}" if rs2 else ""
+            )
             break
+
+
+def update_planned_activity_fuse_line(doc, rs_entries: list,
+                                       data: dict, warnings: list):
+    """
+    Replaces the fuse assignment line in section 20. PLANNED ACTIVITY.
+
+    Template line:
+      'Fuse L9 (63A) : Nokia Power Tapped Fuse L17 (16A) : Nokia Power Tapped'
+
+    Each RS produces one line using:
+      Load Assignment  = Fuse No  (e.g. F8)
+      Ampere           = Breaker size (e.g. 10A)
+      Name             = Rectifier name (e.g. Eltek Flatpack 1)
+
+    Result example:
+      'Fuse F8 (10A) : Nokia Lightspan MF-2 Power Tapped  [Eltek Flatpack 1]'
+    """
+    equipment = data["equipment"]
+
+    fuse_lines = []
+    for rs in rs_entries:
+        # Load Assignment IS the Fuse No
+        load   = rs.get("load", "").strip()
+        ampere = rs.get("ampere", "").strip()
+        name   = rs.get("name", "").strip()
+
+        if not load:
+            continue
+
+        # Build line: "Fuse F8 (10A) : Nokia Lightspan MF-2 Power Tapped  [Eltek Flatpack 1]"
+        line = f"Fuse {load}"
+        if ampere:
+            line += f" ({ampere})"
+        line += f" : {equipment} Power Tapped"
+        if name:
+            line += f"  [{name}]"
+
+        fuse_lines.append(line)
+
+    if not fuse_lines:
+        warnings.append("⚠️ No RS entries found for planned activity fuse lines.")
+        return
+
+    # Find ALL paragraphs that contain old fuse assignment text
+    fuse_line_needles = [
+        "Power Tapped",
+        "Nokia Power Tapped",
+        "Fuse L9",
+        "Fuse L17",
+        "Fuse L",
+    ]
+
+    matched_paras = []
+    for p in iter_all_paragraphs(doc):
+        txt = paragraph_full_text(p)
+        for needle in fuse_line_needles:
+            if needle in txt:
+                matched_paras.append(p)
+                break
+
+    if not matched_paras:
+        warnings.append(
+            "⚠️ Could not find the fuse assignment line in "
+            "'20. PLANNED ACTIVITY PROCEDURES'. "
+            "Make sure template contains 'Nokia Power Tapped' or 'Fuse L'."
+        )
+        return
+
+    # Replace first matched para with first RS line
+    set_paragraph_text(matched_paras[0], fuse_lines[0])
+
+    # Insert extra RS lines after first para
+    last_para = matched_paras[0]
+    for extra_line in fuse_lines[1:]:
+        last_para = insert_paragraph_after(last_para, extra_line)
+
+    # Clear any remaining old matched paragraphs
+    for old_para in matched_paras[1:]:
+        set_paragraph_text(old_para, "")
+
+    warnings.append(
+        f"✅ Planned activity fuse assignment updated: "
+        f"{len(fuse_lines)} line(s) written."
+    )
 
 
 def insert_supporting_documents(doc, tssr_pdf_name: str):
@@ -490,8 +535,8 @@ def insert_supporting_documents(doc, tssr_pdf_name: str):
         return
     anchor, _ = find_in_doc(
         doc,
-        ["Supporting Documents", "Supporting Document",
-         "SUPPORTING DOCUMENTS", "Attachments"]
+        ["SUPPORTING DOCUMENTS", "Supporting Documents",
+         "Supporting Document", "Attachments"]
     )
     if not anchor:
         anchor = doc.paragraphs[-1]
@@ -510,62 +555,29 @@ def generate_docx_bytes(data: dict, rs_entries: list,
 
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
 
-    # ----------------------------------------------------------
-    # Build header title replacement
-    # From debug output the header text (in textbox) likely is:
-    # "Project FTTH: CDO-604_MIN995 Lightspan OLT MF-2 System Power Tapping"
-    # We replace piece by piece to preserve surrounding text.
-    # ----------------------------------------------------------
-    old_header_title = (
-        f"Project FTTH: CDO-604_MIN995 Lightspan OLT MF-2 System Power Tapping"
-    )
-    new_header_title = (
-        f"Project FTTH: {data['site_name']}_{data['plaid']} "
-        f"Lightspan {data['equipment']} System Power Tapping"
-    )
-
     replacements = {
-        # Header title (full match attempt first)
-        old_header_title: new_header_title,
-
-        # Individual pieces for robustness
-        # (in case text is split across <w:t> nodes)
-        "CDO-604": data["site_name"],
-        "MIN699":  data["plaid"],
-        "MIN995":  data["plaid"],
-
-        # Equipment
+        "CDO-604":              data["site_name"],
+        "MIN699":               data["plaid"],
+        "MIN995":               data["plaid"],
         "Nokia Lightspan MF-2": data["equipment"],
         "Lightspan MF-2":       data["equipment"],
-
-        # OLT label
-        "OLT MF-2": olt_label,
-
-        # Prepared by
-        "John Carlo Rabanes": data["prepared_by"],
-
-        # Position — template uses "OLT Engineer" in body
-        # and may use "OLT Rollout Engineer" elsewhere
+        "OLT MF-2":             olt_label,
+        "John Carlo Rabanes":   data["prepared_by"],
         "OLT Rollout Engineer": data["position"],
         "OLT Engineer":         data["position"],
-
-        # Target date
         "< May 19- June 19, 2026 10:00AM-6:00PM>": data["target_datetime"],
         "May 19- June 19, 2026 10:00AM-6:00PM":    data["target_datetime"],
-
-        # Generic placeholders
-        "{{SITE_NAME}}":       data["site_name"],
-        "{{PLAID}}":           data["plaid"],
-        "{{EQUIPMENT}}":       data["equipment"],
-        "{{PREPARED_BY}}":     data["prepared_by"],
-        "{{POSITION}}":        data["position"],
-        "{{TARGET_DATETIME}}": data["target_datetime"],
+        "{{SITE_NAME}}":        data["site_name"],
+        "{{PLAID}}":            data["plaid"],
+        "{{EQUIPMENT}}":        data["equipment"],
+        "{{PREPARED_BY}}":      data["prepared_by"],
+        "{{POSITION}}":         data["position"],
+        "{{TARGET_DATETIME}}":  data["target_datetime"],
     }
 
-    # replace_everywhere now hits textboxes via raw XML too
     replace_everywhere(doc, replacements)
-
     process_rs_section(doc, data, rs_entries, warnings)
+    update_planned_activity_fuse_line(doc, rs_entries, data, warnings)
     insert_supporting_documents(doc, tssr_pdf_name)
 
     out = io.BytesIO()
@@ -651,11 +663,6 @@ with st.expander("🔍 Debug: Inspect all text in template", expanded=False):
         _doc = Document(TEMPLATE_FILE)
         lines = debug_list_all_text(_doc)
         st.code("\n".join(lines), language="text")
-        st.caption(
-            "HEADER-XML lines are from textboxes/drawings — "
-            "this is what was previously invisible. "
-            "Copy the exact text to verify replacements."
-        )
 
 st.divider()
 
@@ -687,6 +694,14 @@ st.divider()
 
 # ── RS Details ────────────────────────────────────────────────
 st.subheader("RS Details")
+
+# ── helper: explain the Load = Fuse clarification ────────────
+st.info(
+    "ℹ️ **Load Assignment = Fuse No.**  "
+    "Enter the fuse/load label (e.g. `F8`, `L3`, `L6`). "
+    "This is used as the FUSE number in the document."
+)
+
 rs_entries = []
 
 for rs_idx in range(1, rs_count + 1):
@@ -695,21 +710,21 @@ for rs_idx in range(1, rs_count + 1):
 
         with fa:
             st.markdown(f"#### RS{rs_idx} Information")
-            rs_name    = st.text_input(
+            rs_name = st.text_input(
                 f"RS{rs_idx} Rectifier Name",
                 placeholder="e.g. Eltek Flatpack 1",
                 key=f"rs{rs_idx}_name",
             )
-            rs_load    = st.text_input(
-                f"RS{rs_idx} Load Assignment",
-                placeholder="e.g. F8",
+            rs_load = st.text_input(
+                # Label clarified: Load Assignment = Fuse No
+                f"RS{rs_idx} Load Assignment (= Fuse No.)",
+                placeholder="e.g. F8  or  L3  or  L6",
                 key=f"rs{rs_idx}_load",
             )
-            rs_fuse_no = st.text_input(
-                f"RS{rs_idx} FUSE No",
-                placeholder="e.g. L3",
-                value="L3" if rs_idx == 1 else "L6",
-                key=f"rs{rs_idx}_fuse_no",
+            rs_ampere = st.text_input(
+                f"RS{rs_idx} Breaker Size",
+                placeholder="e.g. 10A",
+                key=f"rs{rs_idx}_ampere",
             )
 
         with fb:
@@ -739,8 +754,8 @@ for rs_idx in range(1, rs_count + 1):
 
         rs_entries.append({
             "name":               rs_name.strip(),
-            "load":               rs_load.strip(),
-            "fuse_no":            rs_fuse_no.strip(),
+            "load":               rs_load.strip(),   # Load = Fuse No
+            "ampere":             rs_ampere.strip(),
             "load_img_bytes":     load_img,
             "existing_img_bytes": existing_img,
         })
@@ -786,10 +801,7 @@ if st.button("Generate MOP (.docx)", type="primary"):
             st.error(f"RS{i} Rectifier Name is required.")
             rs_valid = False
         if not rs.get("load"):
-            st.error(f"RS{i} Load Assignment is required.")
-            rs_valid = False
-        if not rs.get("fuse_no"):
-            st.error(f"RS{i} FUSE No is required.")
+            st.error(f"RS{i} Load Assignment (Fuse No.) is required.")
             rs_valid = False
     if not rs_valid:
         st.stop()
