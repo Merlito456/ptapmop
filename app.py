@@ -2,6 +2,7 @@ import os
 import re
 import io
 import base64
+from copy import deepcopy
 import streamlit as st
 
 from docx import Document
@@ -16,7 +17,6 @@ from streamlit_js_eval import streamlit_js_eval
 TEMPLATE_FILE = "Template.docx"
 WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
-# Tapping mode constants
 MODE_SINGLE      = "Single Tapping Point"
 MODE_SAME_RS     = "Main + RDNT – Same Rectifier"
 MODE_SEPARATE_RS = "Main + RDNT – Separate Rectifiers"
@@ -165,10 +165,52 @@ def find_in_doc(doc, needles):
 
 
 def insert_paragraph_after(ref_paragraph, text=""):
+    """Plain insert — no formatting copy."""
     new_para = ref_paragraph._parent.add_paragraph()
     ref_paragraph._p.addnext(new_para._p)
     if text:
         new_para.add_run(text)
+    return new_para
+
+
+def insert_paragraph_after_copy_format(ref_paragraph, text=""):
+    """
+    Insert a new paragraph after ref_paragraph and copy its
+    paragraph properties (indentation, spacing, alignment) and
+    first run's character properties (font, size, bold, italic,
+    underline, color) so the new line matches the reference exactly.
+    """
+    new_para = ref_paragraph._parent.add_paragraph()
+    ref_paragraph._p.addnext(new_para._p)
+
+    # Copy paragraph-level properties (pPr)
+    ref_pPr = ref_paragraph._p.pPr
+    if ref_pPr is not None:
+        new_pPr = deepcopy(ref_pPr)
+        # Replace or insert pPr in new paragraph
+        existing_pPr = new_para._p.pPr
+        if existing_pPr is not None:
+            new_para._p.remove(existing_pPr)
+        new_para._p.insert(0, new_pPr)
+
+    if text:
+        new_run = new_para.add_run(text)
+        # Copy first run's character properties
+        if ref_paragraph.runs:
+            ref_run = ref_paragraph.runs[0]
+            try:
+                new_run.bold      = ref_run.bold
+                new_run.italic    = ref_run.italic
+                new_run.underline = ref_run.underline
+                if ref_run.font.name:
+                    new_run.font.name = ref_run.font.name
+                if ref_run.font.size:
+                    new_run.font.size = ref_run.font.size
+                if ref_run.font.color and ref_run.font.color.type:
+                    new_run.font.color.rgb = ref_run.font.color.rgb
+            except Exception:
+                pass
+
     return new_para
 
 
@@ -334,6 +376,7 @@ def build_replacements(data: dict) -> dict:
 
 def fuse_no_line(load: str, olt_label: str, equipment: str,
                   label: str = None) -> str:
+    """Build a FUSE No line string."""
     txt = (
         f"FUSE No: {load} {olt_label} "
         f"– ({normalize_spaces(equipment)} Power tapping point)"
@@ -345,6 +388,7 @@ def fuse_no_line(load: str, olt_label: str, equipment: str,
 
 def build_tapping_summary(tapping_mode: str, rs_entries: list,
                            equipment: str) -> list:
+    """Build planned activity fuse assignment lines."""
     lines = []
 
     if tapping_mode == MODE_SINGLE:
@@ -411,29 +455,12 @@ def build_tapping_summary(tapping_mode: str, rs_entries: list,
 def process_rs_section(doc, data: dict, rs_entries: list,
                         tapping_mode: str, total_rectifiers: int,
                         warnings: list):
-    """
-    Processes the RS / Rectifier sections of the document.
-
-    total_rectifiers:
-      The total number of PHYSICAL rectifiers on site (1 or 2).
-      Even if the tapping mode is Single or Same RS,
-      if total_rectifiers == 2, RECTIFIER 2 is still documented
-      (with its name, images) but without a tapping FUSE line.
-
-    Scenarios:
-      total_rectifiers=1, MODE_SINGLE      → RS1 tapped, no RS2 section
-      total_rectifiers=1, MODE_SAME_RS     → RS1 MAIN+RDNT, no RS2 section
-      total_rectifiers=2, MODE_SINGLE      → RS1 tapped, RS2 documented only
-      total_rectifiers=2, MODE_SAME_RS     → RS1 MAIN+RDNT, RS2 documented only
-      total_rectifiers=2, MODE_SEPARATE_RS → RS1 MAIN, RS2 RDNT
-    """
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
     equipment  = data["equipment"]
 
     rs1 = rs_entries[0] if len(rs_entries) > 0 else None
     rs2 = rs_entries[1] if len(rs_entries) > 1 else None
 
-    # Show RS2 section if there are 2 physical rectifiers
     show_rs2_section = (total_rectifiers >= 2)
 
     # ----------------------------------------------------------
@@ -460,7 +487,7 @@ def process_rs_section(doc, data: dict, rs_entries: list,
     ])
 
     # ----------------------------------------------------------
-    # RECTIFIER 1 header
+    # RECTIFIER 1 header  (FIX 1: cleaner format)
     # ----------------------------------------------------------
     if rect_paras and rs1:
         if tapping_mode == MODE_SINGLE:
@@ -470,13 +497,13 @@ def process_rs_section(doc, data: dict, rs_entries: list,
             )
         elif tapping_mode == MODE_SAME_RS:
             rdnt_info = (
-                f" | RDNT: {rs1['rdnt_load']}"
+                f" / RDNT: {rs1['rdnt_load']}"
                 if rs1.get("rdnt_load") else ""
             )
             r1_header = (
                 f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: "
-                f"(RECTIFIER 1 – {rs1['name']} "
-                f"| MAIN: {rs1['load']}{rdnt_info})"
+                f"(RECTIFIER 1 – {rs1['name']}"
+                f" / MAIN: {rs1['load']}{rdnt_info})"
             )
         elif tapping_mode == MODE_SEPARATE_RS:
             r1_header = (
@@ -487,6 +514,7 @@ def process_rs_section(doc, data: dict, rs_entries: list,
 
     # ----------------------------------------------------------
     # RS1 FUSE line(s)
+    # FIX 2: Use insert_paragraph_after_copy_format for RDNT line
     # ----------------------------------------------------------
     if rs1_fuse_para and rs1:
         if tapping_mode == MODE_SINGLE:
@@ -494,19 +522,21 @@ def process_rs_section(doc, data: dict, rs_entries: list,
                 rs1_fuse_para,
                 fuse_no_line(rs1["load"], olt_label, equipment)
             )
+
         elif tapping_mode == MODE_SAME_RS:
-            # MAIN fuse line
+            # MAIN line (replace in-place, keeps original formatting)
             set_paragraph_text(
                 rs1_fuse_para,
                 fuse_no_line(rs1["load"], olt_label, equipment, "MAIN")
             )
-            # RDNT fuse line inserted immediately after
+            # RDNT line (copy format from MAIN line)
             if rs1.get("rdnt_load"):
-                insert_paragraph_after(
+                insert_paragraph_after_copy_format(
                     rs1_fuse_para,
                     fuse_no_line(
                         rs1["rdnt_load"], olt_label, equipment, "RDNT")
                 )
+
         elif tapping_mode == MODE_SEPARATE_RS:
             set_paragraph_text(
                 rs1_fuse_para,
@@ -518,25 +548,20 @@ def process_rs_section(doc, data: dict, rs_entries: list,
     # ----------------------------------------------------------
     if len(rect_paras) >= 2:
         if not show_rs2_section:
-            # Only 1 physical rectifier on site — clear entirely
             set_paragraph_text(rect_paras[1], "")
 
         elif tapping_mode == MODE_SEPARATE_RS and rs2:
-            # RS2 is the RDNT tapping rectifier
             set_paragraph_text(
                 rect_paras[1],
                 f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: "
                 f"(RECTIFIER 2 – {rs2['name']} – RDNT)"
             )
-
         else:
-            # 2 physical rectifiers but RS2 is NOT a tapping point
-            # Document it but note it's not used for tapping
-            rs2_display_name = rs2["name"] if rs2 else "Rectifier 2"
+            rs2_display = rs2["name"] if rs2 else "Rectifier 2"
             set_paragraph_text(
                 rect_paras[1],
                 f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: "
-                f"(RECTIFIER 2 – {rs2_display_name} – Not Used for Tapping)"
+                f"(RECTIFIER 2 – {rs2_display} – Not Used for Tapping)"
             )
 
     # ----------------------------------------------------------
@@ -544,23 +569,20 @@ def process_rs_section(doc, data: dict, rs_entries: list,
     # ----------------------------------------------------------
     if rs2_fuse_para:
         if tapping_mode == MODE_SEPARATE_RS and rs2 and show_rs2_section:
-            # RS2 is the RDNT tapping point
             set_paragraph_text(
                 rs2_fuse_para,
                 fuse_no_line(rs2["load"], olt_label, equipment, "RDNT")
             )
         elif show_rs2_section:
-            # RS2 exists on site but not used for tapping
             set_paragraph_text(
                 rs2_fuse_para,
                 "No tapping point assigned to this rectifier."
             )
         else:
-            # Only 1 rectifier on site
             set_paragraph_text(rs2_fuse_para, "")
 
     # ----------------------------------------------------------
-    # RECTIFIER 1 caption (below existing image)
+    # RECTIFIER 1 caption
     # ----------------------------------------------------------
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 1":
@@ -582,22 +604,20 @@ def process_rs_section(doc, data: dict, rs_entries: list,
             break
 
     # ----------------------------------------------------------
-    # RECTIFIER 2 caption (below existing image)
+    # RECTIFIER 2 caption
     # ----------------------------------------------------------
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 2":
             if not show_rs2_section:
-                # Only 1 physical rectifier — clear caption
                 set_paragraph_text(p, "")
             elif tapping_mode == MODE_SEPARATE_RS and rs2:
                 set_paragraph_text(
                     p, f"RECTIFIER 2 – {rs2['name']} – RDNT")
             else:
-                # 2 rectifiers, RS2 not used for tapping
-                rs2_display_name = rs2["name"] if rs2 else "Rectifier 2"
+                rs2_display = rs2["name"] if rs2 else "Rectifier 2"
                 set_paragraph_text(
                     p,
-                    f"RECTIFIER 2 – {rs2_display_name} – Not Used for Tapping"
+                    f"RECTIFIER 2 – {rs2_display} – Not Used for Tapping"
                 )
             break
 
@@ -617,7 +637,6 @@ def process_rs_section(doc, data: dict, rs_entries: list,
 
     # ----------------------------------------------------------
     # RS2 Load Schedule image
-    # Always insert if 2 rectifiers on site, regardless of tapping mode
     # ----------------------------------------------------------
     if show_rs2_section and rs2 and rs2.get("load_img_bytes"):
         m = replace_placeholder_with_image(
@@ -646,7 +665,6 @@ def process_rs_section(doc, data: dict, rs_entries: list,
 
     # ----------------------------------------------------------
     # RS2 Existing Rectifier image
-    # Always insert if 2 rectifiers on site
     # ----------------------------------------------------------
     if show_rs2_section and rs2 and rs2.get("existing_img_bytes"):
         m = replace_placeholder_with_image(
@@ -667,6 +685,7 @@ def process_rs_section(doc, data: dict, rs_entries: list,
 
 # =============================================================
 # PLANNED ACTIVITY FUSE LINE UPDATER
+# FIX 3: Copy format from matched paragraph for all inserted lines
 # =============================================================
 
 def update_planned_activity_fuse_line(doc, rs_entries: list,
@@ -697,10 +716,17 @@ def update_planned_activity_fuse_line(doc, rs_entries: list,
         )
         return
 
+    # Replace first matched paragraph with first fuse line
+    # (keeps original paragraph formatting)
     set_paragraph_text(matched_paras[0], fuse_lines[0])
-    last_para = matched_paras[0]
+    ref_para = matched_paras[0]
+
+    # Insert extra lines copying format from the first matched paragraph
+    last_para = ref_para
     for extra in fuse_lines[1:]:
-        last_para = insert_paragraph_after(last_para, extra)
+        last_para = insert_paragraph_after_copy_format(last_para, extra)
+
+    # Clear remaining old matched paragraphs
     for old in matched_paras[1:]:
         set_paragraph_text(old, "")
 
@@ -758,7 +784,8 @@ def generate_docx_bytes(data: dict, rs_entries: list,
             + "\n".join(f"  • {line}" for line in audit[:10])
         )
     else:
-        warnings.append("✅ No remaining MF-2/Nokia OLT references detected.")
+        warnings.append(
+            "✅ No remaining MF-2/Nokia OLT references detected.")
 
     out = io.BytesIO()
     doc.save(out)
@@ -872,7 +899,6 @@ with g2:
         value="May 19- June 19, 2026 10:00AM-6:00PM",
     )
 
-# Equipment replacement preview
 if equipment:
     _parts  = equipment.strip().split()
     _vendor = _parts[0] if _parts else "Nokia"
@@ -895,7 +921,6 @@ st.divider()
 
 # ── Power Tapping Configuration ───────────────────────────────
 st.subheader("Power Tapping Configuration")
-
 pc1, pc2 = st.columns(2)
 
 with pc1:
@@ -904,9 +929,8 @@ with pc1:
         options=[1, 2],
         index=1,
         help=(
-            "How many physical rectifiers exist on site. "
-            "All rectifiers will be documented. "
-            "Tapping point assignment depends on the mode below."
+            "Total physical rectifiers on site. "
+            "All rectifiers will be documented regardless of tapping mode."
         ),
     )
 
@@ -916,58 +940,35 @@ with pc2:
         options=[MODE_SINGLE, MODE_SAME_RS, MODE_SEPARATE_RS],
         index=0,
         help=(
-            f"**{MODE_SINGLE}**: One fuse/load – MAIN only.  \n"
-            f"**{MODE_SAME_RS}**: MAIN + RDNT from the **same** rectifier.  \n"
-            f"**{MODE_SEPARATE_RS}**: MAIN from RS1, RDNT from RS2 "
-            f"(different rectifiers).  \n\n"
-            f"Note: If 2 rectifiers are on site but only 1 is used "
-            f"for tapping, select Single or Same RS. "
-            f"The unused rectifier will still be documented."
+            f"**{MODE_SINGLE}**: One fuse – MAIN only.  \n"
+            f"**{MODE_SAME_RS}**: MAIN + RDNT from the same rectifier.  \n"
+            f"**{MODE_SEPARATE_RS}**: RS1 = MAIN, RS2 = RDNT "
+            f"(different rectifiers)."
         ),
     )
 
-# Scenario explanation
+
 def get_scenario_description(mode, total):
     if total == 1:
-        if mode == MODE_SINGLE:
-            return (
-                "📌 **1 rectifier on site, single tapping point.**  \n"
-                "RS1 is tapped. No RS2 section."
-            )
-        elif mode == MODE_SAME_RS:
-            return (
-                "📌 **1 rectifier on site, MAIN + RDNT from same rectifier.**  \n"
-                "RS1 provides both tapping points. No RS2 section."
-            )
-        else:
-            return (
-                "⚠️ Separate Rectifiers mode requires 2 rectifiers. "
-                "Please set total rectifiers to 2."
-            )
-    else:  # total == 2
-        if mode == MODE_SINGLE:
-            return (
-                "📌 **2 rectifiers on site, single tapping point.**  \n"
-                "RS1 is tapped (MAIN only). "
-                "RS2 is documented but **not used for tapping**."
-            )
-        elif mode == MODE_SAME_RS:
-            return (
-                "📌 **2 rectifiers on site, MAIN + RDNT from RS1.**  \n"
-                "RS1 provides both tapping points. "
-                "RS2 is documented but **not used for tapping**."
-            )
-        else:
-            return (
-                "📌 **2 rectifiers on site, separate tapping points.**  \n"
-                "RS1 = MAIN tapping point. RS2 = RDNT tapping point."
-            )
+        scenarios = {
+            MODE_SINGLE:      "📌 1 rectifier on site. Single tapping point (MAIN only). No RS2 section.",
+            MODE_SAME_RS:     "📌 1 rectifier on site. MAIN + RDNT from same rectifier. No RS2 section.",
+            MODE_SEPARATE_RS: "⚠️ Separate Rectifiers mode requires 2 rectifiers. Set total to 2.",
+        }
+    else:
+        scenarios = {
+            MODE_SINGLE:      "📌 2 rectifiers on site. RS1 tapped (MAIN). RS2 documented but not tapped.",
+            MODE_SAME_RS:     "📌 2 rectifiers on site. RS1 MAIN + RDNT. RS2 documented but not tapped.",
+            MODE_SEPARATE_RS: "📌 2 rectifiers on site. RS1 = MAIN tapping. RS2 = RDNT tapping.",
+        }
+    return scenarios.get(mode, "")
 
-scenario_desc = get_scenario_description(tapping_mode, total_rectifiers)
-if "⚠️" in scenario_desc:
-    st.warning(scenario_desc)
+
+desc = get_scenario_description(tapping_mode, total_rectifiers)
+if "⚠️" in desc:
+    st.warning(desc)
 else:
-    st.info(scenario_desc)
+    st.info(desc)
 
 st.divider()
 
@@ -978,13 +979,12 @@ st.info("ℹ️ **Load Assignment = Fuse No.** e.g. `F8`, `L3`, `L6`")
 rs_entries = []
 
 # ── RS1 ───────────────────────────────────────────────────────
-rs1_expander_labels = {
+rs1_labels = {
     MODE_SINGLE:      "RS1 Details – Tapping Point",
     MODE_SAME_RS:     "RS1 Details – MAIN + RDNT (Same Rectifier)",
     MODE_SEPARATE_RS: "RS1 Details – MAIN Tapping Point",
 }
-with st.expander(rs1_expander_labels.get(tapping_mode, "RS1 Details"),
-                 expanded=True):
+with st.expander(rs1_labels.get(tapping_mode, "RS1 Details"), expanded=True):
     fa, fb = st.columns(2)
 
     with fa:
@@ -994,14 +994,13 @@ with st.expander(rs1_expander_labels.get(tapping_mode, "RS1 Details"),
             placeholder="e.g. Eltek Flatpack 1",
             key="rs1_name",
         )
-
-        rs1_main_load_labels = {
+        rs1_load_label = {
             MODE_SINGLE:      "RS1 Load Assignment (= Fuse No.)",
             MODE_SAME_RS:     "RS1 MAIN Load Assignment (= MAIN Fuse No.)",
             MODE_SEPARATE_RS: "RS1 MAIN Load Assignment (= Fuse No.)",
         }
         rs1_load   = st.text_input(
-            rs1_main_load_labels.get(tapping_mode, "RS1 Load Assignment"),
+            rs1_load_label.get(tapping_mode, "RS1 Load Assignment"),
             placeholder="e.g. F8",
             key="rs1_load",
         )
@@ -1011,7 +1010,6 @@ with st.expander(rs1_expander_labels.get(tapping_mode, "RS1 Details"),
             key="rs1_ampere",
         )
 
-        # RDNT fields — only for SAME RS mode
         if tapping_mode == MODE_SAME_RS:
             st.markdown("---")
             st.markdown("**RDNT Tapping Point (same rectifier)**")
@@ -1065,26 +1063,20 @@ rs_entries.append({
 })
 
 # ── RS2 ───────────────────────────────────────────────────────
-# Show RS2 input whenever there are 2 physical rectifiers on site
 if total_rectifiers >= 2:
-
-    rs2_expander_labels = {
+    rs2_labels = {
         MODE_SINGLE:      "RS2 Details – On Site (Not Used for Tapping)",
         MODE_SAME_RS:     "RS2 Details – On Site (Not Used for Tapping)",
         MODE_SEPARATE_RS: "RS2 Details – RDNT Tapping Point",
     }
     with st.expander(
-            rs2_expander_labels.get(tapping_mode, "RS2 Details"),
-            expanded=True):
+            rs2_labels.get(tapping_mode, "RS2 Details"), expanded=True):
 
-        # Contextual note
         if tapping_mode in (MODE_SINGLE, MODE_SAME_RS):
             st.info(
                 "ℹ️ This rectifier is on site but **not used for tapping**. "
-                "It will be documented in the MOP for reference."
+                "It will be fully documented in the MOP."
             )
-        else:
-            st.info("ℹ️ This rectifier is the **RDNT tapping point**.")
 
         fa, fb = st.columns(2)
 
@@ -1095,10 +1087,8 @@ if total_rectifiers >= 2:
                 placeholder="e.g. Eltek Flatpack 2",
                 key="rs2_name",
             )
-
-            # Load assignment only needed for SEPARATE_RS mode
             if tapping_mode == MODE_SEPARATE_RS:
-                rs2_load = st.text_input(
+                rs2_load   = st.text_input(
                     "RS2 RDNT Load Assignment (= Fuse No.)",
                     placeholder="e.g. L6",
                     key="rs2_load",
@@ -1109,16 +1099,13 @@ if total_rectifiers >= 2:
                     key="rs2_ampere",
                 )
             else:
-                # Not a tapping point — no load/fuse needed
                 rs2_load   = ""
                 rs2_ampere = ""
-                st.caption(
-                    "No tapping assignment needed for this rectifier."
-                )
+                st.caption("No tapping assignment for this rectifier.")
 
         with fb:
             st.markdown("#### RS2 Load Schedule Image")
-            st.caption("Fuse panel / load schedule photo (for documentation)")
+            st.caption("Fuse panel / load schedule photo (documentation)")
             rs2_load_img = image_input_widget(
                 label_upload    = "Upload RS2 Load Schedule image",
                 label_paste     = "Paste RS2 Load Schedule from clipboard",
@@ -1130,7 +1117,7 @@ if total_rectifiers >= 2:
             )
 
         st.markdown("#### RS2 Existing Rectifier Photo")
-        st.caption("Physical photo of the existing rectifier (for documentation)")
+        st.caption("Physical photo of the existing rectifier (documentation)")
         rs2_exist_img = image_input_widget(
             label_upload    = "Upload RS2 Existing Rectifier image",
             label_paste     = "Paste RS2 Existing Rectifier from clipboard",
@@ -1166,8 +1153,7 @@ st.divider()
 st.subheader("Supporting Documents")
 tssr_pdf = st.file_uploader(
     "TSSR PDF (filename will be written into the Word document)",
-    type=["pdf"],
-    key="tssr_pdf",
+    type=["pdf"], key="tssr_pdf",
 )
 if tssr_pdf:
     st.success(f"PDF ready: {tssr_pdf.name}")
@@ -1192,57 +1178,33 @@ required_base = [
 
 if st.button("Generate MOP (.docx)", type="primary"):
 
-    # Validate base fields
     missing = [k for k in required_base if not data.get(k)]
     if missing:
         st.error("Please fill in: " + ", ".join(missing))
         st.stop()
 
-    # Validate RS fields
     rs_valid = True
 
-    # RS1 always required
     if not rs_entries[0].get("name"):
         st.error("RS1 Rectifier Name is required.")
         rs_valid = False
     if not rs_entries[0].get("load"):
         st.error("RS1 Load Assignment is required.")
         rs_valid = False
-
-    # RDNT load required for Same RS mode
-    if tapping_mode == MODE_SAME_RS:
-        if not rs_entries[0].get("rdnt_load"):
-            st.error(
-                "RDNT Load Assignment is required "
-                "for Same Rectifier mode."
-            )
-            rs_valid = False
-
-    # RS2 name required if 2 rectifiers on site
+    if tapping_mode == MODE_SAME_RS and not rs_entries[0].get("rdnt_load"):
+        st.error("RDNT Load Assignment is required for Same Rectifier mode.")
+        rs_valid = False
     if total_rectifiers >= 2:
         if len(rs_entries) < 2 or not rs_entries[1].get("name"):
-            st.error(
-                "RS2 Rectifier Name is required "
-                "when 2 rectifiers are on site."
-            )
+            st.error("RS2 Rectifier Name is required when 2 rectifiers are on site.")
             rs_valid = False
-
-    # RS2 load required only for Separate RS mode
     if tapping_mode == MODE_SEPARATE_RS:
         if len(rs_entries) < 2 or not rs_entries[1].get("load"):
-            st.error(
-                "RS2 Load Assignment is required "
-                "for Separate Rectifiers mode."
-            )
+            st.error("RS2 Load Assignment is required for Separate Rectifiers mode.")
             rs_valid = False
-
-    # Warn if Separate RS selected but only 1 rectifier
-    if tapping_mode == MODE_SEPARATE_RS and total_rectifiers < 2:
-        st.error(
-            "Separate Rectifiers mode requires 2 rectifiers on site. "
-            "Please set total rectifiers to 2."
-        )
-        rs_valid = False
+        if total_rectifiers < 2:
+            st.error("Separate Rectifiers mode requires 2 rectifiers on site.")
+            rs_valid = False
 
     if not rs_valid:
         st.stop()
@@ -1262,7 +1224,6 @@ if st.button("Generate MOP (.docx)", type="primary"):
         )
 
         st.success("MOP generated successfully!")
-
         for w in gen_warnings:
             if w.startswith("✅"):
                 st.success(w)
