@@ -2,7 +2,6 @@ import os
 import re
 import io
 import base64
-from lxml import etree
 import streamlit as st
 
 from docx import Document
@@ -135,8 +134,7 @@ def replace_everywhere(doc, replacements: dict):
             pass
 
 
-def find_paragraph_containing(container, needles: list,
-                               case_insensitive=True):
+def find_paragraph_containing(container, needles, case_insensitive=True):
     for p in iter_all_paragraphs(container):
         txt = paragraph_full_text(p)
         chk = txt.lower() if case_insensitive else txt
@@ -147,7 +145,7 @@ def find_paragraph_containing(container, needles: list,
     return None
 
 
-def find_in_doc(doc, needles: list):
+def find_in_doc(doc, needles):
     p = find_paragraph_containing(doc, needles)
     if p:
         return p, "body"
@@ -169,9 +167,7 @@ def insert_paragraph_after(ref_paragraph, text=""):
     return new_para
 
 
-def replace_placeholder_with_image(doc, placeholders: list,
-                                    image_bytes: bytes,
-                                    width=Inches(5.0)):
+def replace_placeholder_with_image(doc, placeholders, image_bytes, width=Inches(5.0)):
     for p in iter_all_paragraphs(doc):
         full = paragraph_full_text(p)
         for ph in placeholders:
@@ -186,34 +182,39 @@ def replace_placeholder_with_image(doc, placeholders: list,
     return None
 
 
-def clear_placeholders(doc, placeholders: list):
-    mapping = {ph: "" for ph in placeholders}
-    replace_everywhere(doc, mapping)
+def clear_placeholders(doc, placeholders):
+    replace_everywhere(doc, {ph: "" for ph in placeholders})
 
 
-def add_hyperlink(paragraph, text: str, url: str,
-                  color="0000FF", underline=True):
-    part = paragraph.part
-    r_id = part.relate_to(url, RT.HYPERLINK, is_external=True)
-    hyperlink = OxmlElement("w:hyperlink")
-    hyperlink.set(qn("r:id"), r_id)
-    new_run = OxmlElement("w:r")
-    rPr = OxmlElement("w:rPr")
-    if color:
-        c = OxmlElement("w:color")
-        c.set(qn("w:val"), color)
-        rPr.append(c)
-    if underline:
-        u = OxmlElement("w:u")
-        u.set(qn("w:val"), "single")
-        rPr.append(u)
-    new_run.append(rPr)
-    t = OxmlElement("w:t")
-    t.text = text
-    new_run.append(t)
-    hyperlink.append(new_run)
-    paragraph._p.append(hyperlink)
-    return hyperlink
+# =============================================================
+# AUDIT
+# =============================================================
+
+def audit_remaining_mf2(doc) -> list:
+    """
+    Scan for any remaining MF-2 / Nokia OLT references after replacement.
+    Returns list of paragraph texts still containing those strings.
+    """
+    suspects = ["MF-2", "MF2", "OLT MF", "Lightspan"]
+    found = []
+
+    for p in iter_all_paragraphs(doc):
+        txt = paragraph_full_text(p)
+        for s in suspects:
+            if s in txt:
+                found.append(f"[body/table] {txt.strip()[:120]}")
+                break
+
+    for section in doc.sections:
+        ns = WORD_NS
+        for t_node in section.header._element.iter(f"{{{ns}}}t"):
+            txt = t_node.text or ""
+            for s in suspects:
+                if s in txt:
+                    found.append(f"[header-xml] {txt.strip()[:120]}")
+                    break
+
+    return found
 
 
 # =============================================================
@@ -287,257 +288,222 @@ def build_olt_label(equipment: str, custom_olt_label: str) -> str:
     return normalize_spaces(custom_olt_label) or normalize_spaces(equipment)
 
 
+def build_replacements(data: dict) -> dict:
+    """
+    Comprehensive replacement map — catches ALL MF-2 and Nokia OLT
+    variants in body, tables, header textboxes.
+    Order: most specific → least specific.
+    """
+    equipment = data["equipment"]
+    olt_label = build_olt_label(equipment, data["olt_label_custom"])
+    site_name = data["site_name"]
+    plaid     = data["plaid"]
+
+    parts  = equipment.strip().split()
+    vendor = parts[0] if parts else "Nokia"
+    model  = parts[-1] if len(parts) > 1 else equipment
+
+    return {
+        # ── Equipment name (most specific first) ──────────────
+        "Nokia Lightspan MF-2":     equipment,
+        "Nokia Lightspan MF2":      equipment,
+        "Lightspan MF-2":           equipment,
+        "Lightspan MF2":            equipment,
+
+        # ── Vendor + OLT label combos ─────────────────────────
+        "Nokia / OLT MF-2":         f"{vendor} / {olt_label}",
+        "Nokia/ OLT MF-2":          f"{vendor} / {olt_label}",
+        "Nokia /OLT MF-2":          f"{vendor} / {olt_label}",
+
+        # ── Nokia OLT MF-2 text variants ─────────────────────
+        "Nokia OLT MF-2":           f"{vendor} {olt_label}",
+        "Nokia OLT MF2":            f"{vendor} {olt_label}",
+
+        # ── OLT label standalone ──────────────────────────────
+        "OLT MF-2":                 olt_label,
+        "OLT MF2":                  olt_label,
+
+        # ── Bare model (least specific among equipment) ───────
+        "MF-2":                     model,
+        "MF2":                      model,
+
+        # ── Site / Plaid ──────────────────────────────────────
+        "CDO-604_MIN995":           f"{site_name}_{plaid}",
+        "CDO-604_MIN699":           f"{site_name}_{plaid}",
+        "CDO-604":                  site_name,
+        "MIN699":                   plaid,
+        "MIN995":                   plaid,
+
+        # ── People ────────────────────────────────────────────
+        "John Carlo Rabanes":       data["prepared_by"],
+        "OLT Rollout Engineer":     data["position"],
+        "OLT Engineer":             data["position"],
+
+        # ── Date ─────────────────────────────────────────────
+        "< May 19- June 19, 2026 10:00AM-6:00PM>": data["target_datetime"],
+        "May 19- June 19, 2026 10:00AM-6:00PM":    data["target_datetime"],
+
+        # ── Generic placeholders ──────────────────────────────
+        "{{SITE_NAME}}":            site_name,
+        "{{PLAID}}":                plaid,
+        "{{EQUIPMENT}}":            equipment,
+        "{{PREPARED_BY}}":          data["prepared_by"],
+        "{{POSITION}}":             data["position"],
+        "{{TARGET_DATETIME}}":      data["target_datetime"],
+    }
+
+
 def build_fuse_line(load: str, olt_label: str, equipment: str) -> str:
-    """
-    load = Load Assignment = Fuse No (e.g. F8, L3, L6)
-    Produces:
-      FUSE No: F8 OLT MF-2 – (Nokia Lightspan MF-2 Power tapping point)
-    """
     return (
         f"FUSE No: {load} {olt_label} "
         f"– ({normalize_spaces(equipment)} Power tapping point)"
     )
 
 
-def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
+def process_rs_section(doc, data, rs_entries, warnings):
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
     equipment  = data["equipment"]
-
     rs1 = rs_entries[0] if len(rs_entries) > 0 else None
     rs2 = rs_entries[1] if len(rs_entries) > 1 else None
 
-    # ----------------------------------------------------------
-    # A. "PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE" headers
-    # ----------------------------------------------------------
-    rectifier_header_paras = []
-    for p in iter_all_paragraphs(doc):
-        if "PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE" in paragraph_full_text(p).upper():
-            rectifier_header_paras.append(p)
-
-    if len(rectifier_header_paras) >= 1 and rs1:
+    # PROPOSED RECTIFIER SYSTEM headers
+    rect_paras = [
+        p for p in iter_all_paragraphs(doc)
+        if "PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE" in paragraph_full_text(p).upper()
+    ]
+    if len(rect_paras) >= 1 and rs1:
         set_paragraph_text(
-            rectifier_header_paras[0],
-            f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: "
-            f"(RECTIFIER 1 – {rs1['name']})"
+            rect_paras[0],
+            f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: (RECTIFIER 1 – {rs1['name']})"
         )
-    if len(rectifier_header_paras) >= 2:
-        if rs2:
-            set_paragraph_text(
-                rectifier_header_paras[1],
-                f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: "
-                f"(RECTIFIER 2 – {rs2['name']})"
-            )
-        else:
-            set_paragraph_text(rectifier_header_paras[1], "")
+    if len(rect_paras) >= 2:
+        set_paragraph_text(
+            rect_paras[1],
+            f"PROPOSED RECTIFIER SYSTEM LOAD BREAKER FUSE: (RECTIFIER 2 – {rs2['name']})"
+            if rs2 else ""
+        )
 
-    # ----------------------------------------------------------
-    # B. RS1 FUSE line
-    #    Template: "FUSE No: {{load}}+ Equipment –(Nokia Power tapping point)"
-    #    Uses rs1["load"] as the fuse number
-    # ----------------------------------------------------------
+    # RS1 FUSE line
     rs1_fuse_para, _ = find_in_doc(doc, [
-        "{{load}}",
-        "{{load}}+ Equipment",
+        "{{load}}", "{{load}}+ Equipment",
         "FUSE No: L3 Nokia OLT MF-2",
-        "FUSE No: L3 OLT MF-2",
-        "FUSE No: L3",
+        "FUSE No: L3 OLT MF-2", "FUSE No: L3",
     ])
     if rs1_fuse_para and rs1:
-        set_paragraph_text(
-            rs1_fuse_para,
-            build_fuse_line(rs1["load"], olt_label, equipment)
-        )
+        set_paragraph_text(rs1_fuse_para,
+                           build_fuse_line(rs1["load"], olt_label, equipment))
 
-    # ----------------------------------------------------------
-    # C. RS2 FUSE line
-    #    Uses rs2["load"] as the fuse number
-    # ----------------------------------------------------------
+    # RS2 FUSE line
     rs2_fuse_para, _ = find_in_doc(doc, [
         "FUSE No: L6 Nokia OLT MF-2",
-        "FUSE No: L6 OLT MF-2",
-        "FUSE No: L6",
+        "FUSE No: L6 OLT MF-2", "FUSE No: L6",
     ])
     if rs2_fuse_para:
-        if rs2:
-            set_paragraph_text(
-                rs2_fuse_para,
-                build_fuse_line(rs2["load"], olt_label, equipment)
-            )
-        else:
-            set_paragraph_text(rs2_fuse_para, "")
+        set_paragraph_text(
+            rs2_fuse_para,
+            build_fuse_line(rs2["load"], olt_label, equipment) if rs2 else ""
+        )
 
-    # ----------------------------------------------------------
-    # D. RS1 Load Schedule image
-    # ----------------------------------------------------------
+    # RS1 Load Schedule image
     if rs1 and rs1.get("load_img_bytes"):
-        matched = replace_placeholder_with_image(
-            doc, RS1_LOAD_PH, rs1["load_img_bytes"], width=Inches(5.0))
-        if matched:
-            warnings.append(f"✅ RS1 Load Schedule image inserted (matched: '{matched}').")
-        else:
-            warnings.append(
-                f"⚠️ RS1 Load Schedule placeholder not found. "
-                f"Tried: {RS1_LOAD_PH}"
-            )
+        m = replace_placeholder_with_image(doc, RS1_LOAD_PH, rs1["load_img_bytes"])
+        warnings.append(
+            f"✅ RS1 Load Schedule inserted ('{m}')." if m
+            else f"⚠️ RS1 Load Schedule placeholder not found. Tried: {RS1_LOAD_PH}"
+        )
     else:
         clear_placeholders(doc, RS1_LOAD_PH)
 
-    # ----------------------------------------------------------
-    # E. RS2 Load Schedule image
-    # ----------------------------------------------------------
+    # RS2 Load Schedule image
     if rs2 and rs2.get("load_img_bytes"):
-        matched = replace_placeholder_with_image(
-            doc, RS2_LOAD_PH, rs2["load_img_bytes"], width=Inches(5.0))
-        if matched:
-            warnings.append(f"✅ RS2 Load Schedule image inserted (matched: '{matched}').")
-        else:
-            warnings.append(
-                f"⚠️ RS2 Load Schedule placeholder not found. "
-                f"Tried: {RS2_LOAD_PH}"
-            )
+        m = replace_placeholder_with_image(doc, RS2_LOAD_PH, rs2["load_img_bytes"])
+        warnings.append(
+            f"✅ RS2 Load Schedule inserted ('{m}')." if m
+            else f"⚠️ RS2 Load Schedule placeholder not found. Tried: {RS2_LOAD_PH}"
+        )
     else:
         clear_placeholders(doc, RS2_LOAD_PH)
 
-    # ----------------------------------------------------------
-    # F. RS1 EXISTING IMAGE
-    # ----------------------------------------------------------
+    # RS1 Existing image
     if rs1 and rs1.get("existing_img_bytes"):
-        matched = replace_placeholder_with_image(
-            doc, RS1_EXIST_PH, rs1["existing_img_bytes"], width=Inches(5.0))
-        if matched:
-            warnings.append(f"✅ RS1 Existing image inserted (matched: '{matched}').")
-        else:
-            warnings.append(
-                f"⚠️ RS1 EXISTING IMAGE not found. Tried: {RS1_EXIST_PH}")
+        m = replace_placeholder_with_image(doc, RS1_EXIST_PH, rs1["existing_img_bytes"])
+        warnings.append(
+            f"✅ RS1 Existing image inserted ('{m}')." if m
+            else f"⚠️ RS1 EXISTING IMAGE not found. Tried: {RS1_EXIST_PH}"
+        )
     else:
         clear_placeholders(doc, RS1_EXIST_PH)
 
-    # RECTIFIER 1 caption
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 1":
-            set_paragraph_text(
-                p,
-                f"RECTIFIER 1 – {rs1['name']}" if rs1 else ""
-            )
+            set_paragraph_text(p, f"RECTIFIER 1 – {rs1['name']}" if rs1 else "")
             break
 
-    # ----------------------------------------------------------
-    # G. RS2 EXISTING IMAGE
-    # ----------------------------------------------------------
+    # RS2 Existing image
     if rs2 and rs2.get("existing_img_bytes"):
-        matched = replace_placeholder_with_image(
-            doc, RS2_EXIST_PH, rs2["existing_img_bytes"], width=Inches(5.0))
-        if matched:
-            warnings.append(f"✅ RS2 Existing image inserted (matched: '{matched}').")
-        else:
-            warnings.append(
-                f"⚠️ RS2 EXISTING IMAGE not found. Tried: {RS2_EXIST_PH}")
+        m = replace_placeholder_with_image(doc, RS2_EXIST_PH, rs2["existing_img_bytes"])
+        warnings.append(
+            f"✅ RS2 Existing image inserted ('{m}')." if m
+            else f"⚠️ RS2 EXISTING IMAGE not found. Tried: {RS2_EXIST_PH}"
+        )
     else:
         clear_placeholders(doc, RS2_EXIST_PH)
 
-    # RECTIFIER 2 caption
     for p in iter_all_paragraphs(doc):
         if paragraph_full_text(p).strip() == "RECTIFIER 2":
-            set_paragraph_text(
-                p,
-                f"RECTIFIER 2 – {rs2['name']}" if rs2 else ""
-            )
+            set_paragraph_text(p, f"RECTIFIER 2 – {rs2['name']}" if rs2 else "")
             break
 
 
-def update_planned_activity_fuse_line(doc, rs_entries: list,
-                                       data: dict, warnings: list):
-    """
-    Replaces the fuse assignment line in section 20. PLANNED ACTIVITY.
-
-    Template line:
-      'Fuse L9 (63A) : Nokia Power Tapped Fuse L17 (16A) : Nokia Power Tapped'
-
-    Each RS produces one line using:
-      Load Assignment  = Fuse No  (e.g. F8)
-      Ampere           = Breaker size (e.g. 10A)
-      Name             = Rectifier name (e.g. Eltek Flatpack 1)
-
-    Result example:
-      'Fuse F8 (10A) : Nokia Lightspan MF-2 Power Tapped  [Eltek Flatpack 1]'
-    """
+def update_planned_activity_fuse_line(doc, rs_entries, data, warnings):
     equipment = data["equipment"]
-
     fuse_lines = []
     for rs in rs_entries:
-        # Load Assignment IS the Fuse No
         load   = rs.get("load", "").strip()
         ampere = rs.get("ampere", "").strip()
         name   = rs.get("name", "").strip()
-
         if not load:
             continue
-
-        # Build line: "Fuse F8 (10A) : Nokia Lightspan MF-2 Power Tapped  [Eltek Flatpack 1]"
         line = f"Fuse {load}"
         if ampere:
             line += f" ({ampere})"
         line += f" : {equipment} Power Tapped"
         if name:
             line += f"  [{name}]"
-
         fuse_lines.append(line)
 
     if not fuse_lines:
-        warnings.append("⚠️ No RS entries found for planned activity fuse lines.")
+        warnings.append("⚠️ No RS entries for planned activity fuse lines.")
         return
-
-    # Find ALL paragraphs that contain old fuse assignment text
-    fuse_line_needles = [
-        "Power Tapped",
-        "Nokia Power Tapped",
-        "Fuse L9",
-        "Fuse L17",
-        "Fuse L",
-    ]
 
     matched_paras = []
     for p in iter_all_paragraphs(doc):
         txt = paragraph_full_text(p)
-        for needle in fuse_line_needles:
-            if needle in txt:
-                matched_paras.append(p)
-                break
+        if any(n in txt for n in ["Power Tapped", "Nokia Power Tapped",
+                                   "Fuse L9", "Fuse L17", "Fuse L"]):
+            matched_paras.append(p)
 
     if not matched_paras:
-        warnings.append(
-            "⚠️ Could not find the fuse assignment line in "
-            "'20. PLANNED ACTIVITY PROCEDURES'. "
-            "Make sure template contains 'Nokia Power Tapped' or 'Fuse L'."
-        )
+        warnings.append("⚠️ Fuse assignment line not found in planned activity section.")
         return
 
-    # Replace first matched para with first RS line
     set_paragraph_text(matched_paras[0], fuse_lines[0])
-
-    # Insert extra RS lines after first para
     last_para = matched_paras[0]
-    for extra_line in fuse_lines[1:]:
-        last_para = insert_paragraph_after(last_para, extra_line)
-
-    # Clear any remaining old matched paragraphs
-    for old_para in matched_paras[1:]:
-        set_paragraph_text(old_para, "")
+    for extra in fuse_lines[1:]:
+        last_para = insert_paragraph_after(last_para, extra)
+    for old in matched_paras[1:]:
+        set_paragraph_text(old, "")
 
     warnings.append(
-        f"✅ Planned activity fuse assignment updated: "
-        f"{len(fuse_lines)} line(s) written."
-    )
+        f"✅ Planned activity fuse lines updated: {len(fuse_lines)} line(s).")
 
 
-def insert_supporting_documents(doc, tssr_pdf_name: str):
+def insert_supporting_documents(doc, tssr_pdf_name):
     if not tssr_pdf_name:
         return
     anchor, _ = find_in_doc(
-        doc,
-        ["SUPPORTING DOCUMENTS", "Supporting Documents",
-         "Supporting Document", "Attachments"]
-    )
+        doc, ["SUPPORTING DOCUMENTS", "Supporting Documents",
+              "Supporting Document", "Attachments"])
     if not anchor:
         anchor = doc.paragraphs[-1]
     p = anchor._parent.add_paragraph()
@@ -545,40 +511,29 @@ def insert_supporting_documents(doc, tssr_pdf_name: str):
     p.add_run(f"TSSR: {tssr_pdf_name}")
 
 
-def generate_docx_bytes(data: dict, rs_entries: list,
-                         tssr_pdf_name: str):
+def generate_docx_bytes(data, rs_entries, tssr_pdf_name):
     if not os.path.exists(TEMPLATE_FILE):
         raise FileNotFoundError("Template.docx not found in repo root.")
 
     doc = Document(TEMPLATE_FILE)
     warnings = []
 
-    olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
-
-    replacements = {
-        "CDO-604":              data["site_name"],
-        "MIN699":               data["plaid"],
-        "MIN995":               data["plaid"],
-        "Nokia Lightspan MF-2": data["equipment"],
-        "Lightspan MF-2":       data["equipment"],
-        "OLT MF-2":             olt_label,
-        "John Carlo Rabanes":   data["prepared_by"],
-        "OLT Rollout Engineer": data["position"],
-        "OLT Engineer":         data["position"],
-        "< May 19- June 19, 2026 10:00AM-6:00PM>": data["target_datetime"],
-        "May 19- June 19, 2026 10:00AM-6:00PM":    data["target_datetime"],
-        "{{SITE_NAME}}":        data["site_name"],
-        "{{PLAID}}":            data["plaid"],
-        "{{EQUIPMENT}}":        data["equipment"],
-        "{{PREPARED_BY}}":      data["prepared_by"],
-        "{{POSITION}}":         data["position"],
-        "{{TARGET_DATETIME}}":  data["target_datetime"],
-    }
-
+    replacements = build_replacements(data)
     replace_everywhere(doc, replacements)
+
     process_rs_section(doc, data, rs_entries, warnings)
     update_planned_activity_fuse_line(doc, rs_entries, data, warnings)
     insert_supporting_documents(doc, tssr_pdf_name)
+
+    # Audit for any remaining MF-2 references
+    audit = audit_remaining_mf2(doc)
+    if audit:
+        warnings.append(
+            "⚠️ Possible remaining MF-2 references found after replacement:\n"
+            + "\n".join(f"  • {line}" for line in audit[:10])
+        )
+    else:
+        warnings.append("✅ No remaining MF-2/Nokia OLT references detected.")
 
     out = io.BytesIO()
     doc.save(out)
@@ -590,7 +545,7 @@ def generate_docx_bytes(data: dict, rs_entries: list,
 # CLIPBOARD HELPER
 # =============================================================
 
-def clipboard_image_to_bytes(eval_key: str):
+def clipboard_image_to_bytes(eval_key):
     js = """
     async () => {
       try {
@@ -609,9 +564,7 @@ def clipboard_image_to_bytes(eval_key: str):
           }
         }
         return null;
-      } catch (e) {
-        return "ERROR:" + e.toString();
-      }
+      } catch (e) { return "ERROR:" + e.toString(); }
     }
     """
     result = streamlit_js_eval(js_expressions=js, key=eval_key, want_output=True)
@@ -629,15 +582,11 @@ def uploaded_to_bytes(uploaded):
     return uploaded.getvalue() if uploaded else None
 
 
-def image_input_widget(label_upload, label_paste,
-                        upload_key, paste_btn_key,
-                        session_key, eval_key,
+def image_input_widget(label_upload, label_paste, upload_key,
+                        paste_btn_key, session_key, eval_key,
                         preview_caption=""):
     uploaded = st.file_uploader(
-        label_upload,
-        type=["png", "jpg", "jpeg", "bmp"],
-        key=upload_key,
-    )
+        label_upload, type=["png", "jpg", "jpeg", "bmp"], key=upload_key)
     if st.button(label_paste, key=paste_btn_key):
         st.session_state[session_key] = clipboard_image_to_bytes(eval_key)
     img_bytes = uploaded_to_bytes(uploaded) or st.session_state.get(session_key)
@@ -657,7 +606,6 @@ if not os.path.exists(TEMPLATE_FILE):
     st.error("**Template.docx not found** in repo root.")
     st.stop()
 
-# ── Debug ─────────────────────────────────────────────────────
 with st.expander("🔍 Debug: Inspect all text in template", expanded=False):
     if st.button("List all text (body + header + footer + XML textboxes)"):
         _doc = Document(TEMPLATE_FILE)
@@ -666,7 +614,6 @@ with st.expander("🔍 Debug: Inspect all text in template", expanded=False):
 
 st.divider()
 
-# ── General Information ───────────────────────────────────────
 st.subheader("General Information")
 g1, g2 = st.columns(2)
 
@@ -676,7 +623,7 @@ with g1:
     equipment        = st.text_input("Equipment", value="Nokia Lightspan MF-2")
     olt_label_custom = st.text_input(
         "Custom OLT Label (leave blank if Nokia Lightspan MF-2)",
-        placeholder="e.g. OLT MF-4",
+        placeholder="e.g. OLT MA5800",
     )
 
 with g2:
@@ -690,16 +637,30 @@ with g2:
     rs_count = st.selectbox(
         "Number of RS (Rectifier Systems)", options=[1, 2], index=1)
 
+# Show what the equipment replacement will look like
+if equipment:
+    parts  = equipment.strip().split()
+    vendor = parts[0] if parts else "Nokia"
+    model  = parts[-1] if len(parts) > 1 else equipment
+    olt_lbl = (
+        "OLT MF-2" if normalize_spaces(equipment).lower() == "nokia lightspan mf-2"
+        else (olt_label_custom.strip() or equipment)
+    )
+    st.info(
+        f"**Equipment replacement preview:**  \n"
+        f"- `Nokia Lightspan MF-2` → `{equipment}`  \n"
+        f"- `OLT MF-2` → `{olt_lbl}`  \n"
+        f"- `Nokia OLT MF-2` → `{vendor} {olt_lbl}`  \n"
+        f"- `Nokia / OLT MF-2` → `{vendor} / {olt_lbl}`  \n"
+        f"- `MF-2` → `{model}`"
+    )
+
 st.divider()
 
-# ── RS Details ────────────────────────────────────────────────
 st.subheader("RS Details")
-
-# ── helper: explain the Load = Fuse clarification ────────────
 st.info(
     "ℹ️ **Load Assignment = Fuse No.**  "
-    "Enter the fuse/load label (e.g. `F8`, `L3`, `L6`). "
-    "This is used as the FUSE number in the document."
+    "Enter the fuse/load label (e.g. `F8`, `L3`, `L6`)."
 )
 
 rs_entries = []
@@ -716,7 +677,6 @@ for rs_idx in range(1, rs_count + 1):
                 key=f"rs{rs_idx}_name",
             )
             rs_load = st.text_input(
-                # Label clarified: Load Assignment = Fuse No
                 f"RS{rs_idx} Load Assignment (= Fuse No.)",
                 placeholder="e.g. F8  or  L3  or  L6",
                 key=f"rs{rs_idx}_load",
@@ -754,7 +714,7 @@ for rs_idx in range(1, rs_count + 1):
 
         rs_entries.append({
             "name":               rs_name.strip(),
-            "load":               rs_load.strip(),   # Load = Fuse No
+            "load":               rs_load.strip(),
             "ampere":             rs_ampere.strip(),
             "load_img_bytes":     load_img,
             "existing_img_bytes": existing_img,
@@ -762,18 +722,14 @@ for rs_idx in range(1, rs_count + 1):
 
 st.divider()
 
-# ── Supporting Documents ──────────────────────────────────────
 st.subheader("Supporting Documents")
 tssr_pdf = st.file_uploader(
-    "TSSR PDF (filename will be written into the Word document)",
-    type=["pdf"], key="tssr_pdf",
-)
+    "TSSR PDF", type=["pdf"], key="tssr_pdf")
 if tssr_pdf:
     st.success(f"PDF ready: {tssr_pdf.name}")
 
 st.divider()
 
-# ── Generate ──────────────────────────────────────────────────
 data = {
     "site_name":        site_name.strip(),
     "plaid":            plaid.strip(),
@@ -784,13 +740,10 @@ data = {
     "target_datetime":  target_datetime.strip(),
 }
 
-required_base = [
-    "site_name", "plaid", "equipment",
-    "prepared_by", "position", "target_datetime",
-]
-
 if st.button("Generate MOP (.docx)", type="primary"):
-    missing = [k for k in required_base if not data.get(k)]
+    missing = [k for k in ["site_name", "plaid", "equipment",
+                            "prepared_by", "position", "target_datetime"]
+               if not data.get(k)]
     if missing:
         st.error("Please fill in: " + ", ".join(missing))
         st.stop()
@@ -801,7 +754,7 @@ if st.button("Generate MOP (.docx)", type="primary"):
             st.error(f"RS{i} Rectifier Name is required.")
             rs_valid = False
         if not rs.get("load"):
-            st.error(f"RS{i} Load Assignment (Fuse No.) is required.")
+            st.error(f"RS{i} Load Assignment is required.")
             rs_valid = False
     if not rs_valid:
         st.stop()
@@ -812,12 +765,10 @@ if st.button("Generate MOP (.docx)", type="primary"):
             rs_entries=rs_entries,
             tssr_pdf_name=(tssr_pdf.name if tssr_pdf else ""),
         )
-
         out_name = (
             f"MOP_{safe_filename(data['site_name'])}"
             f"_{safe_filename(data['plaid'])}.docx"
         )
-
         st.success("MOP generated successfully!")
         for w in gen_warnings:
             if w.startswith("✅"):
@@ -826,7 +777,6 @@ if st.button("Generate MOP (.docx)", type="primary"):
                 st.warning(w)
             else:
                 st.info(w)
-
         st.download_button(
             label="⬇️ Download MOP",
             data=docx_bytes,
