@@ -2,6 +2,7 @@ import os
 import re
 import io
 import base64
+from lxml import etree
 import streamlit as st
 
 from docx import Document
@@ -9,12 +10,14 @@ from docx.shared import Inches
 from docx.oxml import OxmlElement
 from docx.oxml.ns import qn
 from docx.opc.constants import RELATIONSHIP_TYPE as RT
-from copy import deepcopy
 
 from streamlit_js_eval import streamlit_js_eval
 
 
 TEMPLATE_FILE = "Template.docx"
+
+# XML namespaces used in Word documents
+WORD_NS = "http://schemas.openxmlformats.org/wordprocessingml/2006/main"
 
 
 # =============================================================
@@ -31,12 +34,7 @@ def safe_filename(s: str) -> str:
 
 
 def iter_all_paragraphs(container):
-    """
-    Yield ALL paragraphs inside a container:
-    - direct paragraphs
-    - paragraphs inside tables (recursively)
-    Works for Document, header, footer, table cell, etc.
-    """
+    """Yield all paragraphs in body/table cells recursively."""
     for p in container.paragraphs:
         yield p
     for t in container.tables:
@@ -49,20 +47,18 @@ def paragraph_full_text(paragraph) -> str:
     return "".join(run.text for run in paragraph.runs)
 
 
+def set_paragraph_text(paragraph, text: str):
+    """Replace paragraph text preserving first run formatting."""
+    for i, run in enumerate(paragraph.runs):
+        run.text = text if i == 0 else ""
+    if not paragraph.runs:
+        paragraph.add_run(text)
+
+
 def replace_text_in_paragraph_preserve_format(paragraph, replacements: dict):
     """
-    Replaces text in a paragraph that may be split across multiple runs.
-
-    Strategy:
-    1. Build full text from all runs.
-    2. Check if any replacement key is in the full text.
-    3. If yes, collapse all runs into one (preserving first run's format),
-       apply replacement, restore text.
-
-    This correctly handles:
-    - text split across runs due to formatting
-    - bold/italic/underline/color preservation on first run
-    - header table cells
+    Replace text in paragraph that may be split across multiple runs.
+    Preserves first run formatting (bold, italic, underline, color, font).
     """
     full = paragraph_full_text(paragraph)
     if not full.strip():
@@ -78,24 +74,25 @@ def replace_text_in_paragraph_preserve_format(paragraph, replacements: dict):
     if not changed:
         return
 
-    # Preserve formatting of first run
     if paragraph.runs:
         first_run = paragraph.runs[0]
-        # Save formatting
         bold      = first_run.bold
         italic    = first_run.italic
         underline = first_run.underline
         font_name = first_run.font.name
         font_size = first_run.font.size
-        font_color = first_run.font.color.rgb if (
-            first_run.font.color and first_run.font.color.type
-        ) else None
+        try:
+            font_color = (
+                first_run.font.color.rgb
+                if first_run.font.color and first_run.font.color.type
+                else None
+            )
+        except Exception:
+            font_color = None
 
-        # Wipe all runs
         for run in paragraph.runs:
             run.text = ""
 
-        # Set new text in first run
         first_run.text      = new_full
         first_run.bold      = bold
         first_run.italic    = italic
@@ -105,49 +102,84 @@ def replace_text_in_paragraph_preserve_format(paragraph, replacements: dict):
         if font_size:
             first_run.font.size = font_size
         if font_color:
-            first_run.font.color.rgb = font_color
+            try:
+                first_run.font.color.rgb = font_color
+            except Exception:
+                pass
     else:
         paragraph.add_run(new_full)
 
 
 def replace_text_in_container(container, replacements: dict):
-    """Apply replacements to all paragraphs in container (body + table cells)."""
     for p in iter_all_paragraphs(container):
         replace_text_in_paragraph_preserve_format(p, replacements)
 
 
+# =============================================================
+# RAW XML TEXT REPLACEMENT (for headers/footers with textboxes)
+# =============================================================
+
+def replace_in_xml_text_nodes(xml_element, replacements: dict):
+    """
+    Walk ALL <w:t> nodes in the XML tree and do plain string replacement.
+    This reaches text inside:
+    - text boxes  (<w:txbxContent>)
+    - drawings
+    - shapes
+    - anything python-docx .paragraphs doesn't expose
+
+    Note: this does NOT handle text split across runs.
+    For split-run text in headers, we also run the run-reconstruction approach.
+    """
+    ns = WORD_NS
+    for t_node in xml_element.iter(f"{{{ns}}}t"):
+        if t_node.text:
+            new_text = t_node.text
+            for old, new in replacements.items():
+                if old and old in new_text:
+                    new_text = new_text.replace(old, new)
+            if new_text != t_node.text:
+                t_node.text = new_text
+
+
 def replace_everywhere(doc, replacements: dict):
     """
-    Replace in:
-    - document body (paragraphs + table cells)
-    - ALL section headers (paragraphs + table cells inside header)
-    - ALL section footers (paragraphs + table cells inside footer)
+    Replace text in:
+    1. Body paragraphs + table cells (run-aware, format-preserving)
+    2. Header/footer via python-docx paragraph access
+    3. Header/footer raw XML (catches textboxes, drawings, shapes)
     """
-    # Body
+    # 1. Body
     replace_text_in_container(doc, replacements)
 
-    # Headers and footers — iterate sections
+    # 2 & 3. All sections headers/footers
     for section in doc.sections:
-        # Header
-        hdr = section.header
-        replace_text_in_container(hdr, replacements)
+        # python-docx paragraph access (tables, plain paragraphs)
+        replace_text_in_container(section.header, replacements)
+        replace_text_in_container(section.footer, replacements)
 
-        # Footer
-        ftr = section.footer
-        replace_text_in_container(ftr, replacements)
+        # Raw XML access (textboxes, drawings, shapes)
+        replace_in_xml_text_nodes(section.header._element, replacements)
+        replace_in_xml_text_nodes(section.footer._element, replacements)
 
-        # Also handle linked/even/first-page headers if they exist
+        # Even/first page headers if present
         try:
-            if section.even_page_header:
-                replace_text_in_container(section.even_page_header, replacements)
+            replace_text_in_container(section.even_page_header, replacements)
+            replace_in_xml_text_nodes(
+                section.even_page_header._element, replacements)
         except Exception:
             pass
         try:
-            if section.first_page_header:
-                replace_text_in_container(section.first_page_header, replacements)
+            replace_text_in_container(section.first_page_header, replacements)
+            replace_in_xml_text_nodes(
+                section.first_page_header._element, replacements)
         except Exception:
             pass
 
+
+# =============================================================
+# FIND PARAGRAPH HELPERS
+# =============================================================
 
 def find_paragraph_containing(container, needles: list,
                                case_insensitive=True):
@@ -183,13 +215,17 @@ def insert_paragraph_after(ref_paragraph, text=""):
     return new_para
 
 
+# =============================================================
+# IMAGE PLACEHOLDER REPLACEMENT
+# =============================================================
+
 def replace_placeholder_with_image(doc, placeholders: list,
                                     image_bytes: bytes,
                                     width=Inches(5.0)):
     """
-    Find paragraph containing any placeholder variant,
+    Find paragraph containing any placeholder string,
     clear it, insert image in-place.
-    Returns matched placeholder string or None.
+    Returns the matched placeholder or None.
     """
     for p in iter_all_paragraphs(doc):
         full = paragraph_full_text(p)
@@ -209,6 +245,10 @@ def clear_placeholders(doc, placeholders: list):
     mapping = {ph: "" for ph in placeholders}
     replace_everywhere(doc, mapping)
 
+
+# =============================================================
+# HYPERLINK HELPER
+# =============================================================
 
 def add_hyperlink(paragraph, text: str, url: str,
                   color="0000FF", underline=True):
@@ -241,11 +281,10 @@ def add_hyperlink(paragraph, text: str, url: str,
 
 def debug_list_all_text(doc) -> list:
     """
-    List ALL text found in:
-    - body paragraphs + tables
-    - header paragraphs + tables
-    - footer paragraphs + tables
-    With location labels.
+    List all text from:
+    - body paragraphs + table cells
+    - header/footer paragraphs + table cells
+    - header/footer raw XML <w:t> nodes (catches textboxes)
     """
     lines = []
 
@@ -255,7 +294,7 @@ def debug_list_all_text(doc) -> list:
         if txt:
             lines.append(f"[BODY] {txt}")
 
-    # Headers / footers
+    # Headers / footers via python-docx
     for i, section in enumerate(doc.sections):
         for p in iter_all_paragraphs(section.header):
             txt = paragraph_full_text(p).strip()
@@ -265,6 +304,18 @@ def debug_list_all_text(doc) -> list:
             txt = paragraph_full_text(p).strip()
             if txt:
                 lines.append(f"[FOOTER s{i}] {txt}")
+
+    # Headers / footers via raw XML (textboxes, shapes)
+    ns = WORD_NS
+    for i, section in enumerate(doc.sections):
+        for t_node in section.header._element.iter(f"{{{ns}}}t"):
+            txt = (t_node.text or "").strip()
+            if txt:
+                lines.append(f"[HEADER-XML s{i}] {txt}")
+        for t_node in section.footer._element.iter(f"{{{ns}}}t"):
+            txt = (t_node.text or "").strip()
+            if txt:
+                lines.append(f"[FOOTER-XML s{i}] {txt}")
 
     return lines
 
@@ -303,7 +354,7 @@ RS2_EXIST_PH = [
 
 
 # =============================================================
-# BUSINESS / MOP LOGIC
+# BUSINESS LOGIC
 # =============================================================
 
 def build_olt_label(equipment: str, custom_olt_label: str) -> str:
@@ -317,14 +368,6 @@ def build_fuse_line(fuse_no: str, olt_label: str, equipment: str) -> str:
         f"FUSE No: {fuse_no} {olt_label} "
         f"– ({normalize_spaces(equipment)} Power tapping point)"
     )
-
-
-def set_paragraph_text(paragraph, text: str):
-    """Replace paragraph text, preserving first run formatting."""
-    for i, run in enumerate(paragraph.runs):
-        run.text = text if i == 0 else ""
-    if not paragraph.runs:
-        paragraph.add_run(text)
 
 
 def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
@@ -360,6 +403,7 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
     rs1_fuse_para, _ = find_in_doc(doc, [
         "{{load}}", "FUSE No: L3 Nokia OLT MF-2",
         "FUSE No: L3 OLT MF-2", "FUSE No: L3",
+        "{{load}}+ Equipment",
     ])
     if rs1_fuse_para and rs1:
         set_paragraph_text(
@@ -370,7 +414,8 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
     # C. RS2 FUSE line
     rs2_fuse_para, _ = find_in_doc(doc, [
         "FUSE No: L6 Nokia OLT MF-2",
-        "FUSE No: L6 OLT MF-2", "FUSE No: L6",
+        "FUSE No: L6 OLT MF-2",
+        "FUSE No: L6",
     ])
     if rs2_fuse_para:
         if rs2:
@@ -410,7 +455,8 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
         if matched:
             warnings.append(f"✅ RS1 Existing image inserted (matched: '{matched}').")
         else:
-            warnings.append(f"⚠️ RS1 EXISTING IMAGE placeholder not found. Tried: {RS1_EXIST_PH}")
+            warnings.append(
+                f"⚠️ RS1 EXISTING IMAGE placeholder not found. Tried: {RS1_EXIST_PH}")
     else:
         clear_placeholders(doc, RS1_EXIST_PH)
 
@@ -427,7 +473,8 @@ def process_rs_section(doc, data: dict, rs_entries: list, warnings: list):
         if matched:
             warnings.append(f"✅ RS2 Existing image inserted (matched: '{matched}').")
         else:
-            warnings.append(f"⚠️ RS2 EXISTING IMAGE placeholder not found. Tried: {RS2_EXIST_PH}")
+            warnings.append(
+                f"⚠️ RS2 EXISTING IMAGE placeholder not found. Tried: {RS2_EXIST_PH}")
     else:
         clear_placeholders(doc, RS2_EXIST_PH)
 
@@ -442,7 +489,10 @@ def insert_supporting_documents(doc, tssr_pdf_name: str):
     if not tssr_pdf_name:
         return
     anchor, _ = find_in_doc(
-        doc, ["Supporting Documents", "Supporting Document", "Attachments"])
+        doc,
+        ["Supporting Documents", "Supporting Document",
+         "SUPPORTING DOCUMENTS", "Attachments"]
+    )
     if not anchor:
         anchor = doc.paragraphs[-1]
     p = anchor._parent.add_paragraph()
@@ -450,48 +500,60 @@ def insert_supporting_documents(doc, tssr_pdf_name: str):
     p.add_run(f"TSSR: {tssr_pdf_name}")
 
 
-def generate_docx_bytes(data: dict, rs_entries: list, tssr_pdf_name: str):
+def generate_docx_bytes(data: dict, rs_entries: list,
+                         tssr_pdf_name: str):
     if not os.path.exists(TEMPLATE_FILE):
         raise FileNotFoundError("Template.docx not found in repo root.")
 
     doc = Document(TEMPLATE_FILE)
     warnings = []
 
-    # ----------------------------------------------------------
-    # Build the header project title replacement
-    # Template has: "Project FTTH: CDO-604_MIN995 Lightspan OLT MF-2 System Power Tapping"
-    # We want:      "Project FTTH: <site>_<plaid> Lightspan <equipment> System Power Tapping"
-    #
-    # We replace the individual parts so formatting is preserved
-    # as much as possible.
-    # ----------------------------------------------------------
     olt_label = build_olt_label(data["equipment"], data["olt_label_custom"])
 
+    # ----------------------------------------------------------
+    # Build header title replacement
+    # From debug output the header text (in textbox) likely is:
+    # "Project FTTH: CDO-604_MIN995 Lightspan OLT MF-2 System Power Tapping"
+    # We replace piece by piece to preserve surrounding text.
+    # ----------------------------------------------------------
+    old_header_title = (
+        f"Project FTTH: CDO-604_MIN995 Lightspan OLT MF-2 System Power Tapping"
+    )
+    new_header_title = (
+        f"Project FTTH: {data['site_name']}_{data['plaid']} "
+        f"Lightspan {data['equipment']} System Power Tapping"
+    )
+
     replacements = {
-        # ── Site / Plaid ──────────────────────────────────────
+        # Header title (full match attempt first)
+        old_header_title: new_header_title,
+
+        # Individual pieces for robustness
+        # (in case text is split across <w:t> nodes)
         "CDO-604": data["site_name"],
         "MIN699":  data["plaid"],
-        "MIN995":  data["plaid"],   # also handle MIN995 variant seen in header
+        "MIN995":  data["plaid"],
 
-        # ── Equipment name ────────────────────────────────────
-        # Replace full equipment name first (most specific)
+        # Equipment
         "Nokia Lightspan MF-2": data["equipment"],
-        # Also replace just "Lightspan MF-2" in case site splits it
-        "Lightspan MF-2": data["equipment"],
+        "Lightspan MF-2":       data["equipment"],
 
-        # ── OLT label inside text ─────────────────────────────
-        # "OLT MF-2" may appear in header title
+        # OLT label
         "OLT MF-2": olt_label,
 
-        # ── Prepared by / position ────────────────────────────
+        # Prepared by
         "John Carlo Rabanes": data["prepared_by"],
-        "OLT Rollout Engineer": data["position"],
 
-        # ── Target date ───────────────────────────────────────
+        # Position — template uses "OLT Engineer" in body
+        # and may use "OLT Rollout Engineer" elsewhere
+        "OLT Rollout Engineer": data["position"],
+        "OLT Engineer":         data["position"],
+
+        # Target date
         "< May 19- June 19, 2026 10:00AM-6:00PM>": data["target_datetime"],
         "May 19- June 19, 2026 10:00AM-6:00PM":    data["target_datetime"],
 
-        # ── Generic placeholders (if user added them) ─────────
+        # Generic placeholders
         "{{SITE_NAME}}":       data["site_name"],
         "{{PLAID}}":           data["plaid"],
         "{{EQUIPMENT}}":       data["equipment"],
@@ -500,7 +562,7 @@ def generate_docx_bytes(data: dict, rs_entries: list, tssr_pdf_name: str):
         "{{TARGET_DATETIME}}": data["target_datetime"],
     }
 
-    # This now correctly replaces inside header tables too
+    # replace_everywhere now hits textboxes via raw XML too
     replace_everywhere(doc, replacements)
 
     process_rs_section(doc, data, rs_entries, warnings)
@@ -560,7 +622,10 @@ def image_input_widget(label_upload, label_paste,
                         session_key, eval_key,
                         preview_caption=""):
     uploaded = st.file_uploader(
-        label_upload, type=["png", "jpg", "jpeg", "bmp"], key=upload_key)
+        label_upload,
+        type=["png", "jpg", "jpeg", "bmp"],
+        key=upload_key,
+    )
     if st.button(label_paste, key=paste_btn_key):
         st.session_state[session_key] = clipboard_image_to_bytes(eval_key)
     img_bytes = uploaded_to_bytes(uploaded) or st.session_state.get(session_key)
@@ -582,13 +647,14 @@ if not os.path.exists(TEMPLATE_FILE):
 
 # ── Debug ─────────────────────────────────────────────────────
 with st.expander("🔍 Debug: Inspect all text in template", expanded=False):
-    if st.button("List all text (body + header + footer)"):
+    if st.button("List all text (body + header + footer + XML textboxes)"):
         _doc = Document(TEMPLATE_FILE)
         lines = debug_list_all_text(_doc)
         st.code("\n".join(lines), language="text")
         st.caption(
-            "Copy the exact text from [HEADER] lines to verify what "
-            "your header actually contains, including spelling and spacing."
+            "HEADER-XML lines are from textboxes/drawings — "
+            "this is what was previously invisible. "
+            "Copy the exact text to verify replacements."
         )
 
 st.divider()
@@ -607,13 +673,15 @@ with g1:
     )
 
 with g2:
-    prepared_by     = st.text_input("Prepared By", placeholder="e.g. John Carlo Rabanes")
+    prepared_by     = st.text_input("Prepared By",
+                                     placeholder="e.g. John Carlo Rabanes")
     position        = st.text_input("Position", value="OLT Rollout Engineer")
     target_datetime = st.text_input(
         "Target Date and Time",
         value="May 19- June 19, 2026 10:00AM-6:00PM",
     )
-    rs_count = st.selectbox("Number of RS (Rectifier Systems)", options=[1, 2], index=1)
+    rs_count = st.selectbox(
+        "Number of RS (Rectifier Systems)", options=[1, 2], index=1)
 
 st.divider()
 
